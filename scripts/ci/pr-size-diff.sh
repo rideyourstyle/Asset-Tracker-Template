@@ -17,6 +17,12 @@ mkdir -p "$SIZE_DIR" "$(dirname "$SIZE_COMMENT_PATH")"
 
 PR_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD)
 
+if ! command -v size >/dev/null 2>&1; then
+  echo "App size report unavailable: 'size' (binutils) not found on PATH. See [CI run](${CI_RUN_URL:-})" \
+    > "$SIZE_COMMENT_PATH"
+  exit 0
+fi
+
 # Extract `flash%` and `ram%` for the app image from a Zephyr build log
 extract_app_pct() {
   awk '
@@ -35,11 +41,21 @@ extract_app_pct() {
 # diff isn't dominated by long absolute paths. flash%/ram% come from the
 # Memory region report Zephyr prints at link time and are read out of the
 # corresponding build log.
+#
+# We use the host's `size` from binutils rather than `arm-zephyr-eabi-size`:
+# it's host-arch-agnostic (parses any ELF, output is identical), always
+# present in the Zephyr CI container via build-essential, and immune to
+# Zephyr SDK layout changes (the 0.x -> 1.x bump moved toolchain binaries
+# around and broke the previous PATH lookup).
 size_report() {
   local elf="$1" build_log="$2"
   local flash_pct ram_pct
-  read -r flash_pct ram_pct < <(extract_app_pct "$build_log")
-  arm-zephyr-eabi-size -d "$elf" \
+  # `read` returns non-zero on EOF without a newline; an empty extraction is
+  # fine (the percentages just render as `?`), so don't let it abort the
+  # script under `set -e`.
+  flash_pct=""; ram_pct=""
+  read -r flash_pct ram_pct < <(extract_app_pct "$build_log") || true
+  size -d "$elf" \
     | awk -v fp="${flash_pct:-?}" -v rp="${ram_pct:-?}" '
         NR == 1 {
           printf "%10s %10s %10s %10s %10s %10s %10s\n", \
