@@ -1485,6 +1485,17 @@ static enum smf_state_result connected_sending_run(void *o)
 
 			return SMF_EVENT_HANDLED;
 		}
+
+		/* No data / busy / error: nothing to send, go back to waiting */
+		if (msg->type == STORAGE_BATCH_EMPTY ||
+		    msg->type == STORAGE_BATCH_BUSY  ||
+		    msg->type == STORAGE_BATCH_ERROR) {
+			LOG_WRN("Batch not started (%d), returning to waiting", msg->type);
+			smf_set_state(SMF_CTX(state_object),
+				      &states[STATE_CONNECTED_WAITING]);
+
+			return SMF_EVENT_HANDLED;
+		}
 	}
 
 	return SMF_EVENT_PROPAGATE;
