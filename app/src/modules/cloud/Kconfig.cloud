@@ -31,7 +31,7 @@ config APP_CLOUD_SHADOW_RESPONSE_BUFFER_MAX_SIZE
 
 config APP_CLOUD_REST_SERVER_HOST
 	string "REST API server hostname"
-	default "tracking.rideyourstyle.ch"
+	default "dev.tracking.rideyourstyle.ch"
 	help
 	  Hostname of the tracking REST API server.
 
@@ -60,6 +60,13 @@ config APP_CLOUD_REST_TRACKER_ID_OVERRIDE
 	help
 	  If enabled, APP_CLOUD_REST_TRACKER_ID_FALLBACK is always used as the
 	  tracker ID, ignoring the modem IMEI. Useful for testing.
+
+config APP_CLOUD_REST_API_KEY
+	string "API key for request authentication"
+	default ""
+	help
+	  If non-empty, this value is sent as an 'X-Api-Key: <value>' header
+	  with every HTTP request. Leave empty to disable API key authentication.
 
 config APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS
 	int "Minimum GNSS accuracy to send a position (0 = send always)"

@@ -21,8 +21,9 @@ Das Cloud-Modul:
 ### API-Endpunkt
 
 ```
-PUT http://tracking.rideyourstyle.ch/v1/trackers/{tracker_id}
+PUT http://dev.tracking.rideyourstyle.ch/v1/trackers/{tracker_id}
 Content-Type: application/json
+X-Api-Key: <api-key>
 
 {
   "sampleTimestamp": "2025-01-01T12:00:00.000Z",
@@ -152,6 +153,51 @@ Alle REST-Parameter können per Kconfig angepasst werden (in `overlay-rest.conf`
 | `CONFIG_APP_CLOUD_REST_HTTP_TIMEOUT_SECONDS` | `30` | HTTP-Timeout |
 | `CONFIG_APP_CLOUD_REST_JSON_BUFFER_SIZE` | `512` | JSON-Puffergrösse |
 | `CONFIG_APP_CLOUD_REST_TRACKER_ID_FALLBACK` | `nrf-tracker-unknown` | Fallback-ID wenn IMEI nicht lesbar |
+
+## CI/CD mit Jenkins
+
+Das `Jenkinsfile` liegt im Repository-Root (`project/Jenkinsfile`).
+
+### Jenkins-Job einrichten
+
+1. Neuen **Pipeline**-Job erstellen
+2. Unter *Pipeline*: „Pipeline script from SCM" wählen
+3. SCM: Git, Repository-URL eintragen
+4. **Script Path**: `project/Jenkinsfile`
+
+> `skipDefaultCheckout(true)` ist im Jenkinsfile gesetzt — Jenkins checkt **nicht** automatisch ins Workspace-Root aus. Das Jenkinsfile erledigt den Checkout selbst in das Unterverzeichnis `project/`, damit der west-Workspace korrekt aufgebaut wird.
+
+### Workspace-Struktur (Jenkins)
+
+```
+WORKSPACE/              ← west Workspace-Root
+├── .west/              ← west-Marker (von west init)
+├── project/            ← git-Checkout (dieses Repo)
+│   ├── app/
+│   ├── west.yml
+│   ├── Jenkinsfile
+│   └── ...
+├── nrf/                ← von west update (~5 GB)
+├── zephyr/             ← von west update
+└── modules/ ...        ← von west update
+```
+
+### Pipeline-Parameter
+
+| Parameter | Standard | Beschreibung |
+|---|---|---|
+| `CLEAN_WORKSPACE` | `false` | Löscht den gesamten west-Workspace (ausser `project/`) und lädt alle SDK-Abhängigkeiten neu herunter (~10–20 min). Nötig bei SDK-Versionswechsel oder korruptem Workspace. |
+| `PRISTINE` | `false` | Vollständiger Firmware-Rebuild (`--pristine`). Nötig nach Kconfig-Änderungen in `overlay-rest.conf` oder `prj.conf`. |
+| `FLASH` | `false` | Flasht das angeschlossene Thingy:91 X nach erfolgreichem Build. Nur sinnvoll wenn der Jenkins-Agent direkt per USB am Gerät hängt. |
+
+### Pipeline-Stages
+
+| Stage | Beschreibung |
+|---|---|
+| **Checkout** | Checkt das Repository in `WORKSPACE/project/` aus |
+| **West setup** | Initialisiert den west-Workspace (`west init -l project/`) und aktualisiert alle SDK-Abhängigkeiten (`west update`) |
+| **Build** | Baut die Firmware; archiviert `app_image.hex` als Build-Artefakt |
+| **Flash** | Flasht via `nrfutil device program` (nur wenn `FLASH=true`) |
 
 ## Projektstruktur
 

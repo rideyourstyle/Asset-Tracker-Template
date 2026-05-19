@@ -153,6 +153,16 @@ static void send_position(const struct location_data *gnss_data)
 	/* /v1/trackers/ + tracker_id (max HW_ID_LEN) + NUL */
 	char url_buf[sizeof(CONFIG_APP_CLOUD_REST_API_PATH) + HW_ID_LEN + 2];
 
+	/* Optional headers: API key (empty string = disabled, compile-time constant) */
+	char api_key_hdr[sizeof("X-Api-Key: \r\n") + sizeof(CONFIG_APP_CLOUD_REST_API_KEY)];
+	const char *api_key_hdrs[2] = { NULL, NULL };
+
+	if (sizeof(CONFIG_APP_CLOUD_REST_API_KEY) > 1) {
+		snprintk(api_key_hdr, sizeof(api_key_hdr), "X-Api-Key: %s\r\n",
+			 CONFIG_APP_CLOUD_REST_API_KEY);
+		api_key_hdrs[0] = api_key_hdr;
+	}
+
 	char timestamp[32];
 	int json_len;
 	struct zsock_addrinfo hints = {
@@ -246,6 +256,8 @@ static void send_position(const struct location_data *gnss_data)
 		.response        = http_response_cb,
 		.recv_buf        = recv_buf,
 		.recv_buf_len    = sizeof(recv_buf),
+		.optional_headers = (sizeof(CONFIG_APP_CLOUD_REST_API_KEY) > 1)
+					? api_key_hdrs : NULL,
 	};
 
 	err = http_client_req(sock, &req,
