@@ -1,96 +1,170 @@
-# Asset Tracker Template
+# Asset Tracker — rideyourstyle
 
-[![Release](https://img.shields.io/github/v/release/nrfconnect/Asset-Tracker-Template)](https://github.com/nrfconnect/Asset-Tracker-Template/releases)
-[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=nrfconnect-asset-tracker-template&metric=alert_status)](https://sonarcloud.io/dashboard?id=nrfconnect-asset-tracker-template)
-[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=nrfconnect-asset-tracker-template&metric=coverage)](https://sonarcloud.io/dashboard?id=nrfconnect-asset-tracker-template)
-[![On-commit](https://img.shields.io/github/actions/workflow/status/nrfconnect/Asset-Tracker-Template/build-and-target-test.yml?event=push&branch=main&label=on-commit)](https://github.com/nrfconnect/Asset-Tracker-Template/actions/workflows/build-and-target-test.yml?query=branch%3Amain+event%3Apush)
-[![Nightly](https://img.shields.io/github/actions/workflow/status/nrfconnect/Asset-Tracker-Template/build-and-target-test.yml?event=schedule&branch=main&label=nightly)](https://github.com/nrfconnect/Asset-Tracker-Template/actions/workflows/build-and-target-test.yml?query=branch%3Amain+event%3Aschedule)
-[![PSM Current](https://img.shields.io/endpoint?url=https://nrfconnect.github.io/Asset-Tracker-Template/power_badge.json)](https://nrfconnect.github.io/Asset-Tracker-Template/power_measurements_plot.html)
-[![RAM Usage thingy91x](https://img.shields.io/endpoint?url=https://nrfconnect.github.io/Asset-Tracker-Template/ram_badge.json)](https://nrfconnect.github.io/Asset-Tracker-Template/ram_memory_view.html)
-[![FLASH Usage thingy91x](https://img.shields.io/endpoint?url=https://nrfconnect.github.io/Asset-Tracker-Template/flash_badge.json)](https://nrfconnect.github.io/Asset-Tracker-Template/flash_memory_view.html)
+Dieses Repository ist ein Fork des [Nordic Asset Tracker Template](https://github.com/nrfconnect/Asset-Tracker-Template).
+Der nRF Cloud CoAP Cloud-Stack wurde durch ein eigenes HTTP-REST-Modul ersetzt, das Positionsdaten direkt an `tracking.rideyourstyle.ch` sendet.
 
-## Overview
+## Was wurde geändert
 
-The Asset Tracker Template is a modular framework for developing IoT applications on nRF91-based devices.
-It is built on the [nRF Connect SDK](https://www.nordicsemi.com/Products/Development-software/nRF-Connect-SDK) and [Zephyr RTOS](https://docs.zephyrproject.org/latest/), and provides a modular, event-driven architecture suitable for battery-powered IoT use cases.
-The framework supports features such as cloud connectivity, location tracking, and sensor data collection.
+| Datei | Änderung |
+|---|---|
+| `project/app/src/modules/cloud/cloud.c` | Komplett ersetzt: HTTP POST statt nRF Cloud CoAP |
+| `project/app/src/modules/cloud/Kconfig.cloud` | Vereinfacht: CoAP-Optionen entfernt, REST-Konfiguration hinzugefügt |
+| `project/app/src/modules/cloud/CMakeLists.txt` | Nur noch `cloud.c` (keine CoAP-Untermodule) |
+| `project/app/overlay-rest.conf` | Build-Overlay: aktiviert REST-Modul, deaktiviert nRF Cloud |
 
-The system is organized into modules, each responsible for a specific functionality, such as managing network connectivity, handling cloud communication, or collecting environmental data.
-Modules communicate through [zbus](https://docs.zephyrproject.org/latest/services/zbus/index.html) channels, ensuring loose coupling and maintainability.
+Das Cloud-Modul:
+- Abonniert `location_chan` → GNSS-Position wird als JSON per HTTP POST gesendet
+- Cached optional Umweltdaten (Temp/Druck) und Akkustand
+- Stellt Stub für FOTA-Kanal bereit (FOTA ohne nRF Cloud nicht unterstützt)
+- Beantwortet Shadow-Requests mit leeren Responses, damit `main.c` nicht blockiert
 
-**Supported hardware**:
+### API-Endpunkt
 
-* [Thingy:91 X](https://www.nordicsemi.com/Products/Development-hardware/Nordic-Thingy-91-X)
-* [nRF9151 DK](https://www.nordicsemi.com/Products/Development-hardware/nRF9151-DK)
+```
+PUT http://tracking.rideyourstyle.ch/v1/trackers/{tracker_id}
+Content-Type: application/json
 
-If you are new to nRF91 series and cellular IoT, consider taking the [Nordic Developer Academy Cellular Fundamentals Course](https://academy.nordicsemi.com/courses/cellular-iot-fundamentals).
+{
+  "sampleTimestamp": "2025-01-01T12:00:00.000Z",
+  "latitude": 47.1234567,
+  "longitude": 8.4564567,
+  "pressure": 1013,
+  "speed": 0,
+  "temperature": 22,
+  "gnssAcc": 10,
+  "battery": 3700,
+  "cellRssi": 0
+}
+```
 
-<p align="center">
-  <img src="docs/images/att-map.png" alt="nRF Cloud - Asset tracking map view" width="800" />
-  <br>
-  <em>Thingy:91 X reporting its location to nRF Cloud running the Asset Tracker Template</em>
-</p>
+Die Tracker-ID (`{tracker_id}`) wird aus der Modem-IMEI gelesen (`hw_id_get()`).
+Mit `CONFIG_APP_CLOUD_REST_TRACKER_ID_OVERRIDE=y` und `CONFIG_APP_CLOUD_REST_TRACKER_ID_FALLBACK="90D0BE69"` kann sie fix gesetzt werden.
 
----
+## Voraussetzungen
 
-## Get started
+- nRF Util: `/home/peter/opt/nrfutil`
+- NCS v3.1.1 Toolchain: `/home/peter/ncs/toolchains/v3.1.1` (liefert Compiler, CMake, west)
+- J-Link (USB direkt am Thingy:91 X)
 
-To set up your development environment, build the application, flash it to your device, and connect it to [nRF Cloud](https://nrfcloud.com), follow the [Getting Started](docs/common/getting_started.md) guide.
+## Build
 
----
+Der Build läuft aus dem **lokalen Workspace** (`asset-tracker-template`) — dort ist Zephyr 4.3.99 enthalten, das die aktuelle SMF-API unterstützt. Der NCS v3.1.1 Toolchain liefert nur den Compiler und west.
 
-## Documentation
+**1. In den Workspace wechseln:**
+```bash
+cd /home/peter/repos/tracky_two/asset-tracker-template
+```
 
-<table>
-  <tr>
-    <td><a href="docs/common/getting_started.md">Getting Started</a></td>
-    <td><a href="docs/common/architecture.md">Architecture</a></td>
-    <td><a href="docs/common/configuration.md">Configuration</a></td>
-  </tr>
-  <tr>
-    <td><a href="docs/common/modifying.md">Modifying</a></td>
-    <td><a href="docs/modules/overview_modules.md">Modules</a></td>
-    <td><a href="docs/common/connecting.md">Connecting</a></td>
-  </tr>
-  <tr>
-    <td><a href="docs/common/location_services.md">Location Services</a></td>
-    <td><a href="docs/common/low_power.md">Achieving Low Power</a></td>
-    <td><a href="docs/common/fota.md">Firmware Updates (FOTA)</a></td>
-  </tr>
-  <tr>
-    <td><a href="docs/common/test_and_ci_setup.md">Testing and CI Setup</a></td>
-    <td><a href="docs/common/tooling_troubleshooting.md">Tooling and Troubleshooting</a></td>
-    <td><a href="docs/common/known_issues.md">Known Issues</a></td>
-  </tr>
-  <tr>
-    <td><a href="docs/common/release.md">Release Artifacts</a></td>
-    <td><a href="docs/common/release_notes.md">Release Notes</a></td>
-    <td></td>
-  </tr>
-</table>
+**2. Toolchain-Shell starten** (einmalig pro Terminal-Session):
+```bash
+/home/peter/opt/nrfutil toolchain-manager launch --ncs-version v3.1.1 --shell
+```
 
----
+**3. Bauen:**
 
-## System Overview
+Nur Code-Änderungen (schnell, ~15–30s — TF-M/MCUboot aus Cache):
+```bash
+west build -b thingy91x/nrf9151/ns -d project/app/build project/app -- -DEXTRA_CONF_FILE=overlay-rest.conf
+```
 
-![System overview](docs/images/system_overview.svg)
+Vollständiger Rebuild (nötig nach Kconfig-Änderungen oder Board-Wechsel, ~3–4 min):
+```bash
+west build --pristine -b thingy91x/nrf9151/ns -d project/app/build project/app -- -DEXTRA_CONF_FILE=overlay-rest.conf
+```
 
-Core modules include:
+### Was `overlay-rest.conf` macht
 
-* **[Main](docs/modules/main.md)**: Central coordinator implementing business logic
-* **[Storage](docs/modules/storage.md)**: Data collection and buffering management
-* **[Network](docs/modules/network.md)**: LTE connectivity management
-* **[Cloud](docs/modules/cloud.md)**: nRF Cloud CoAP communication
-* **[Location](docs/modules/location.md)**: GNSS, Wi-Fi, and cellular positioning
-* **[LED](docs/modules/led.md)**: RGB LED control for Thingy:91 X
-* **[Button](docs/modules/button.md)**: User input handling
-* **[FOTA](docs/modules/fota_module.md)**: Firmware over-the-air updates
-* **[Environmental](docs/modules/environmental.md)**: Sensor data collection
-* **[Power](docs/modules/power.md)**: Battery monitoring and power management
+- `CONFIG_NRF_CLOUD=n` — deaktiviert nRF Cloud und alles was davon abhängt (CoAP, FOTA, AGNSS, Provisioning)
+- `CONFIG_NRF_PROVISIONING=n` / `CONFIG_MODEM_ATTEST_TOKEN=n` — deaktiviert nRF-Provisioning
+- `CONFIG_APP_CLOUD=y` — aktiviert das REST-Cloud-Modul
+- `CONFIG_NET_TCP=y` / `CONFIG_HTTP_CLIENT=y` — TCP + HTTP für den REST-Call
+- `CONFIG_HW_ID_LIBRARY=y` / `CONFIG_HW_ID_LIBRARY_SOURCE_IMEI=y` — IMEI als Tracker-ID
 
-### Key Features
+## Flashen
 
-* **State Machine Framework (SMF)**: Predictable behavior with run-to-completion model
-* **Message-Based Communication**: Loose coupling via [zbus](https://docs.nordicsemi.com/bundle/ncs-latest/page/zephyr/services/zbus/index.html) channels
-* **Modular Architecture**: Separation of concerns with dedicated threads for blocking operations
-* **Power Optimization**: LTE PSM enabled by default with configurable power-saving features
+Das Thingy:91 X erscheint am USB als UART-Gerät (`mcuBoot`-Trait, kein J-Link). `west flash` funktioniert daher nicht. Stattdessen direkt mit `nrfutil`:
+
+```bash
+/home/peter/opt/nrfutil device program \
+  --firmware project/app/build/app_image.hex \
+  --traits mcuBoot \
+  --options target=nRF91
+```
+
+Serial-Nummer des angeschlossenen Geräts anzeigen (falls mehrere Geräte angeschlossen):
+```bash
+/home/peter/opt/nrfutil device list
+```
+
+Dann mit expliziter Serial-Nummer flashen:
+```bash
+/home/peter/opt/nrfutil device program \
+  --firmware project/app/build/app_image.hex \
+  --serial-number <SERIAL> \
+  --options target=nRF91
+```
+
+## Debuggen / Logs
+
+Das Build ist mit `CONFIG_UART_CONSOLE=y` konfiguriert — Logs gehen über USB-Serial, **nicht über RTT**. RTT benötigt einen J-Link-Probe; der ist ohne zusätzliche Hardware nicht verfügbar (das Board ist im UART/MCUboot-Modus).
+
+### Serielle Konsole (115200 Baud)
+
+Das Board meldet sich als `/dev/ttyACM0` (Logs + Shell) und `/dev/ttyACM1` (Modem-Trace):
+
+```bash
+screen /dev/ttyACM0 115200
+```
+
+Beenden mit `Ctrl-A` dann `K`.
+
+### Nützliche Shell-Befehle (im seriellen Terminal)
+
+```
+# AT-Befehle direkt senden
+at AT+CGSN          # IMEI lesen (= Tracker-ID in der API)
+at AT+CEREG?        # LTE-Registrierungsstatus
+
+# Sofort Location-Fix + HTTP POST triggern (langen Button-Druck simulieren)
+att_button long
+
+# App-internen Zustand anzeigen
+att_inspect
+
+# Netzwerk
+att_network connect
+att_network disconnect
+
+# Storage
+att_storage stats
+att_storage flush
+```
+
+## Konfiguration
+
+Alle REST-Parameter können per Kconfig angepasst werden (in `overlay-rest.conf` oder `prj.conf`):
+
+| Kconfig-Option | Standard | Beschreibung |
+|---|---|---|
+| `CONFIG_APP_CLOUD_REST_SERVER_HOST` | `tracking.rideyourstyle.ch` | API-Hostname |
+| `CONFIG_APP_CLOUD_REST_SERVER_PORT` | `80` | TCP-Port |
+| `CONFIG_APP_CLOUD_REST_API_PATH` | `/v1/tracks/positions` | Endpunkt-Pfad |
+| `CONFIG_APP_CLOUD_REST_HTTP_TIMEOUT_SECONDS` | `30` | HTTP-Timeout |
+| `CONFIG_APP_CLOUD_REST_JSON_BUFFER_SIZE` | `512` | JSON-Puffergrösse |
+| `CONFIG_APP_CLOUD_REST_TRACKER_ID_FALLBACK` | `nrf-tracker-unknown` | Fallback-ID wenn IMEI nicht lesbar |
+
+## Projektstruktur
+
+```
+asset-tracker-template/          ← west Workspace-Root (dieses Repo)
+├── project/                     ← west manifest + App-Code
+│   └── app/
+│       ├── src/modules/cloud/   ← REST Cloud-Modul (rideyourstyle)
+│       ├── overlay-rest.conf    ← Build-Overlay für REST
+│       ├── boards/              ← Board-spezifische Kconfigs (inkl. thingy91x)
+│       └── sysbuild/            ← MCUboot-Konfiguration
+├── nrf/                         ← NCS SDK (importiert via project/west.yml)
+└── zephyr/                      ← Zephyr RTOS
+```
+
+Der Build läuft aus diesem Workspace selbst — Zephyr 4.3.99 und das lokale `nrf/` (mit den Thingy91x Board-Definitionen) sind bereits enthalten. Der NCS v3.1.1 Toolchain liefert nur den Compiler und west.
