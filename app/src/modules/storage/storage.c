@@ -875,13 +875,15 @@ static void state_buffer_pipe_active_entry(void *o)
 
 	err = start_batch_session(state_object, msg);
 	if (err == -ENODATA) {
-		/* No data available, report it */
+		/* No data available — report and return to idle so no session lingers */
 		send_batch_empty_response(msg->session_id);
+		smf_set_state(SMF_CTX(state_object), &states[STATE_BUFFER_IDLE]);
 
 		return;
 	} else if (err) {
 		LOG_ERR("Failed to start pipe session: %d", err);
 		send_batch_error_response(msg->session_id);
+		smf_set_state(SMF_CTX(state_object), &states[STATE_BUFFER_IDLE]);
 
 		return;
 	}
