@@ -225,13 +225,43 @@ static void send_position(const struct location_data *gnss_data)
 		return;
 	}
 
-	/* Create TCP socket */
+	/* Create TCP or TLS socket */
+#if defined(CONFIG_APP_CLOUD_REST_TLS)
+	sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TLS_1_2);
+#else
 	sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TCP);
+#endif
 	if (sock < 0) {
 		LOG_ERR("socket() failed: %d", errno);
 		zsock_freeaddrinfo(res);
 		return;
 	}
+
+#if defined(CONFIG_APP_CLOUD_REST_TLS)
+	/* TLS offload on nRF91x1 — peer verification disabled (dev/test mode) */
+	{
+		int peer_verify = TLS_PEER_VERIFY_NONE;
+
+		err = zsock_setsockopt(sock, SOL_TLS, TLS_HOSTNAME,
+				       CONFIG_APP_CLOUD_REST_SERVER_HOST,
+				       sizeof(CONFIG_APP_CLOUD_REST_SERVER_HOST) - 1);
+		if (err) {
+			LOG_ERR("TLS_HOSTNAME setsockopt failed: %d", errno);
+			zsock_close(sock);
+			zsock_freeaddrinfo(res);
+			return;
+		}
+
+		err = zsock_setsockopt(sock, SOL_TLS, TLS_PEER_VERIFY,
+				       &peer_verify, sizeof(peer_verify));
+		if (err) {
+			LOG_ERR("TLS_PEER_VERIFY setsockopt failed: %d", errno);
+			zsock_close(sock);
+			zsock_freeaddrinfo(res);
+			return;
+		}
+	}
+#endif
 
 	/* Connect */
 	err = zsock_connect(sock, res->ai_addr, res->ai_addrlen);

@@ -68,6 +68,16 @@ config APP_CLOUD_REST_API_KEY
 	  If non-empty, this value is sent as an 'X-Api-Key: <value>' header
 	  with every HTTP request. Leave empty to disable API key authentication.
 
+config APP_CLOUD_REST_TLS
+	bool "Use TLS (HTTPS) for REST API"
+	default n
+	help
+	  Enable TLS for the REST cloud module. On nRF91x1 the modem handles
+	  TLS as hardware offload — no software TLS stack is needed.
+	  Set APP_CLOUD_REST_SERVER_PORT=443 when enabling this option.
+	  Peer certificate verification is disabled (suitable for dev/test without
+	  provisioning a CA certificate into the modem).
+
 config APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS
 	int "Minimum GNSS accuracy to send a position (0 = send always)"
 	default 0
