@@ -1,27 +1,34 @@
 # Asset Tracker — rideyourstyle
 
 Dieses Repository ist ein Fork des [Nordic Asset Tracker Template](https://github.com/nrfconnect/Asset-Tracker-Template).
-Der nRF Cloud CoAP Cloud-Stack wurde durch ein eigenes HTTP-REST-Modul ersetzt, das Positionsdaten direkt an `tracking.rideyourstyle.ch` sendet.
+Der nRF Cloud CoAP Cloud-Stack wurde durch ein eigenes HTTPS-REST-Modul ersetzt, das Positionsdaten an `dev.tracking.rideyourstyle.ch` sendet.
 
 ## Was wurde geändert
 
 | Datei | Änderung |
 |---|---|
-| `project/app/src/modules/cloud/cloud.c` | Komplett ersetzt: HTTP POST statt nRF Cloud CoAP |
-| `project/app/src/modules/cloud/Kconfig.cloud` | Vereinfacht: CoAP-Optionen entfernt, REST-Konfiguration hinzugefügt |
+| `project/app/src/modules/cloud/cloud.c` | Komplett ersetzt: HTTPS REST statt nRF Cloud CoAP; Peek-and-ACK Batch-Protokoll |
+| `project/app/src/modules/cloud/Kconfig.cloud` | CoAP-Optionen entfernt, REST/TLS/API-Key-Konfiguration hinzugefügt |
 | `project/app/src/modules/cloud/CMakeLists.txt` | Nur noch `cloud.c` (keine CoAP-Untermodule) |
-| `project/app/overlay-rest.conf` | Build-Overlay: aktiviert REST-Modul, deaktiviert nRF Cloud |
+| `project/app/src/modules/storage/storage.h` | `STORAGE_BATCH_ACK` Message-Typ hinzugefügt |
+| `project/app/src/modules/storage/storage.c` | Peek-and-ACK Protokoll: Records bleiben bis zur erfolgreichen Übertragung |
+| `project/app/overlay-rest.conf` | Build-Overlay: REST, LittleFS-Storage, PSM, TLS |
+| `project/app/boards/thingy91x_nrf9151_ns.overlay` | LittleFS-Partition auf 8 MB erweitert |
 
-Das Cloud-Modul:
-- Abonniert `location_chan` → GNSS-Position wird als JSON per HTTP POST gesendet
-- Cached optional Umweltdaten (Temp/Druck) und Akkustand
-- Stellt Stub für FOTA-Kanal bereit (FOTA ohne nRF Cloud nicht unterstützt)
-- Beantwortet Shadow-Requests mit leeren Responses, damit `main.c` nicht blockiert
+### Architektur: Aufzeichnen und Senden getrennt
+
+Aufzeichnung und Übertragung laufen unabhängig:
+
+- **Alle 60 s**: GNSS-Fix wird gesucht und bei Erfolg im externen Flash gespeichert
+- **Alle 10 min**: Alle gepufferten Fixes werden der Reihe nach (älteste zuerst) per HTTPS gesendet
+- **Kein Netz**: Aufzeichnung läuft weiter — bis zu ~7 Tage Puffer im externen Flash
+- **Nach Reconnect**: Alle gepufferten Fixes werden automatisch übertragen
+- **Peek-and-ACK**: Ein Record wird erst aus dem Flash gelöscht, wenn der Server HTTP 2xx zurückgibt. Bei Fehler bleibt er für das nächste Sendeintervall erhalten.
 
 ### API-Endpunkt
 
 ```
-PUT http://dev.tracking.rideyourstyle.ch/v1/trackers/{tracker_id}
+PUT https://dev.tracking.rideyourstyle.ch/v1/trackers/{tracker_id}
 Content-Type: application/json
 X-Api-Key: <api-key>
 
@@ -45,7 +52,6 @@ Mit `CONFIG_APP_CLOUD_REST_TRACKER_ID_OVERRIDE=y` und `CONFIG_APP_CLOUD_REST_TRA
 
 - nRF Util: `/home/peter/opt/nrfutil`
 - NCS v3.1.1 Toolchain: `/home/peter/ncs/toolchains/v3.1.1` (liefert Compiler, CMake, west)
-- J-Link (USB direkt am Thingy:91 X)
 
 ## Build
 
@@ -76,10 +82,13 @@ west build --pristine -b thingy91x/nrf9151/ns -d project/app/build project/app -
 ### Was `overlay-rest.conf` macht
 
 - `CONFIG_NRF_CLOUD=n` — deaktiviert nRF Cloud und alles was davon abhängt (CoAP, FOTA, AGNSS, Provisioning)
-- `CONFIG_NRF_PROVISIONING=n` / `CONFIG_MODEM_ATTEST_TOKEN=n` — deaktiviert nRF-Provisioning
 - `CONFIG_APP_CLOUD=y` — aktiviert das REST-Cloud-Modul
+- `CONFIG_APP_CLOUD_REST_TLS=y` / Port 443 — HTTPS mit TLS-Offload im Modem
 - `CONFIG_NET_TCP=y` / `CONFIG_HTTP_CLIENT=y` — TCP + HTTP für den REST-Call
 - `CONFIG_HW_ID_LIBRARY=y` / `CONFIG_HW_ID_LIBRARY_SOURCE_IMEI=y` — IMEI als Tracker-ID
+- `CONFIG_APP_STORAGE_BACKEND_LITTLEFS=y` — Positions-Puffer im externen SPI-Flash (8 MB, ~7 Tage)
+- `CONFIG_LTE_PSM_REQ=y` — LTE Power Saving Mode (~2 µA im Schlaf zwischen Sendevorgängen)
+- `CONFIG_NRF_MODEM_LIB_TRACE=n` — Modem-Traces deaktiviert (Produktion)
 
 ## Flashen
 
@@ -105,13 +114,28 @@ Dann mit expliziter Serial-Nummer flashen:
   --options target=nRF91
 ```
 
+## LED-Anzeige
+
+| Farbe | Bedeutung |
+|---|---|
+| **Blau** blinkt | GNSS-Suche läuft (alle 60 s, bis zu ~2 min) |
+| **Grün** blinkt | Daten werden gesendet (alle 10 min, HTTP-Batch) |
+| **Rot** blinkt | Kein Mobilfunknetz (Gerät wartet auf Reconnect) |
+| **Lila** blinkt | FOTA-Download (nicht unterstützt in dieser Version) |
+| Keine LED | Gerät wartet auf nächsten Sampling-Zyklus |
+
+Typischer Ablauf:
+1. **Blau** — GNSS-Fix suchen (~30–120 s)
+2. **Keine LED** — warten (~58 s bis zum nächsten Fix)
+3. Alle 10 min kurz **Grün** — gespeicherte Fixes senden
+
 ## Debuggen / Logs
 
-Das Build ist mit `CONFIG_UART_CONSOLE=y` konfiguriert — Logs gehen über USB-Serial, **nicht über RTT**. RTT benötigt einen J-Link-Probe; der ist ohne zusätzliche Hardware nicht verfügbar (das Board ist im UART/MCUboot-Modus).
+Logs gehen über USB-Serial (`CONFIG_UART_CONSOLE=y`), **nicht über RTT**.
 
 ### Serielle Konsole (115200 Baud)
 
-Das Board meldet sich als `/dev/ttyACM0` (Logs + Shell) und `/dev/ttyACM1` (Modem-Trace):
+Das Board meldet sich als `/dev/ttyACM0` (Logs + Shell):
 
 ```bash
 screen /dev/ttyACM0 115200
@@ -119,14 +143,17 @@ screen /dev/ttyACM0 115200
 
 Beenden mit `Ctrl-A` dann `K`.
 
+> Modem-Traces auf `ttyACM1` sind im Produktions-Build deaktiviert (`CONFIG_NRF_MODEM_LIB_TRACE=n`).
+
 ### Nützliche Shell-Befehle (im seriellen Terminal)
 
 ```
 # AT-Befehle direkt senden
 at AT+CGSN          # IMEI lesen (= Tracker-ID in der API)
 at AT+CEREG?        # LTE-Registrierungsstatus
+at AT+CPSMS?        # Aktuell gewährten PSM-Timer abfragen
 
-# Sofort Location-Fix + HTTP POST triggern (langen Button-Druck simulieren)
+# Sofort Location-Fix + Sende-Zyklus triggern (langen Button-Druck simulieren)
 att_button long
 
 # App-internen Zustand anzeigen
@@ -136,29 +163,44 @@ att_inspect
 att_network connect
 att_network disconnect
 
-# Storage
-att_storage stats
-att_storage flush
+# Storage (LittleFS im externen Flash)
+att_storage stats    # Anzahl gepufferter Records anzeigen
+att_storage flush    # Alle Records ausgeben (Debug)
 ```
 
 ## Konfiguration
 
-Alle REST-Parameter können per Kconfig angepasst werden (in `overlay-rest.conf` oder `prj.conf`):
+Alle Parameter können per Kconfig angepasst werden (in `overlay-rest.conf`):
 
-| Kconfig-Option | Standard | Beschreibung |
+| Kconfig-Option | Aktuell | Beschreibung |
 |---|---|---|
 | `CONFIG_APP_CLOUD_REST_SERVER_HOST` | `dev.tracking.rideyourstyle.ch` | API-Hostname |
-| `CONFIG_APP_CLOUD_REST_SERVER_PORT` | `443` | TCP-Port (HTTPS) |
-| `CONFIG_APP_CLOUD_REST_TLS` | `n` | TLS/HTTPS aktivieren |
-| `CONFIG_APP_CLOUD_REST_API_KEY` | `""` | X-Api-Key Header |
+| `CONFIG_APP_CLOUD_REST_SERVER_PORT` | `443` | TCP-Port |
+| `CONFIG_APP_CLOUD_REST_TLS` | `y` | TLS/HTTPS (Modem-Offload) |
+| `CONFIG_APP_CLOUD_REST_API_KEY` | *(gesetzt)* | X-Api-Key Header |
 | `CONFIG_APP_CLOUD_REST_API_PATH` | `/v1/trackers` | Endpunkt-Pfad |
+| `CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS` | `25` | Min. Genauigkeit in Metern (0 = immer senden) |
 | `CONFIG_APP_CLOUD_REST_HTTP_TIMEOUT_SECONDS` | `30` | HTTP-Timeout |
-| `CONFIG_APP_CLOUD_REST_JSON_BUFFER_SIZE` | `512` | JSON-Puffergrösse |
-| `CONFIG_APP_CLOUD_REST_TRACKER_ID_FALLBACK` | `nrf-tracker-unknown` | Fallback-ID wenn IMEI nicht lesbar |
-| `CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS` | `0` | Mindestgenauigkeit für Sendung (0 = immer) |
-| `CONFIG_APP_STORAGE_BACKEND_LITTLEFS` | `n` | LittleFS statt RAM-Buffer |
-| `CONFIG_PM_PARTITION_SIZE_LITTLEFS` | `0x10000` | Flash-Partition für LittleFS |
-| `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE` | `8` (RAM) / `64` (LittleFS) | Max. Records pro Datentyp |
+| `CONFIG_APP_CLOUD_REST_TRACKER_ID_OVERRIDE` | `y` | Feste Tracker-ID verwenden |
+| `CONFIG_APP_CLOUD_REST_TRACKER_ID_FALLBACK` | `90D0BE69` | Feste Tracker-ID |
+| `CONFIG_APP_SAMPLING_INTERVAL_SECONDS` | `60` | GNSS-Aufzeichnungsintervall |
+| `CONFIG_APP_CLOUD_UPDATE_INTERVAL_SECONDS` | `600` | Sendeintervall (10 min) |
+| `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE` | `10000` | Max. gepufferte Records (~7 Tage) |
+| `CONFIG_PM_PARTITION_SIZE_LITTLEFS` | `0x800000` | Flash-Partition (8 MB) |
+| `CONFIG_LTE_PSM_REQ_RPTAU` | `00100001` | PSM-Timer: 10 min Schlaf |
+
+## Storage: Externer SPI-Flash
+
+Das Thingy:91 X hat einen **GD25LE255E (32 MB)** SPI-NOR-Flash. Die Firmware verwendet davon 8 MB für LittleFS.
+
+| | |
+|---|---|
+| Flash-Chip | GD25LE255E, 32 MB |
+| Partition | 8 MB (`0x800000`) |
+| Kapazität | ~10 000 Records |
+| Pufferdauer | **~7 Tage** bei 60 s Intervall |
+| Stromausfall-sicher | Ja — Daten bleiben bei Neustart erhalten |
+| Sendegarantie | Peek-and-ACK: Record bleibt bis HTTP 2xx bestätigt |
 
 ## CI/CD mit Jenkins
 
@@ -212,6 +254,7 @@ asset-tracker-template/          ← west Workspace-Root (dieses Repo)
 ├── project/                     ← west manifest + App-Code
 │   └── app/
 │       ├── src/modules/cloud/   ← REST Cloud-Modul (rideyourstyle)
+│       ├── src/modules/storage/ ← Storage-Modul mit Peek-and-ACK
 │       ├── overlay-rest.conf    ← Build-Overlay für REST
 │       ├── boards/              ← Board-spezifische Kconfigs (inkl. thingy91x)
 │       └── sysbuild/            ← MCUboot-Konfiguration
