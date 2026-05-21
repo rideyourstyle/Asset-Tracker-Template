@@ -54,7 +54,7 @@
 
 		littlefs_storage: partition@0 {
 			label = "littlefs_storage";
-			reg = <0x00000000 0x00100000>;
+			reg = <0x00000000 0x00800000>;  /* 8 MB — overridden by PM at build time */
 		};
 	};
 };

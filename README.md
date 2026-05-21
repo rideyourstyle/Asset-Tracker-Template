@@ -147,12 +147,18 @@ Alle REST-Parameter können per Kconfig angepasst werden (in `overlay-rest.conf`
 
 | Kconfig-Option | Standard | Beschreibung |
 |---|---|---|
-| `CONFIG_APP_CLOUD_REST_SERVER_HOST` | `tracking.rideyourstyle.ch` | API-Hostname |
-| `CONFIG_APP_CLOUD_REST_SERVER_PORT` | `80` | TCP-Port |
-| `CONFIG_APP_CLOUD_REST_API_PATH` | `/v1/tracks/positions` | Endpunkt-Pfad |
+| `CONFIG_APP_CLOUD_REST_SERVER_HOST` | `dev.tracking.rideyourstyle.ch` | API-Hostname |
+| `CONFIG_APP_CLOUD_REST_SERVER_PORT` | `443` | TCP-Port (HTTPS) |
+| `CONFIG_APP_CLOUD_REST_TLS` | `n` | TLS/HTTPS aktivieren |
+| `CONFIG_APP_CLOUD_REST_API_KEY` | `""` | X-Api-Key Header |
+| `CONFIG_APP_CLOUD_REST_API_PATH` | `/v1/trackers` | Endpunkt-Pfad |
 | `CONFIG_APP_CLOUD_REST_HTTP_TIMEOUT_SECONDS` | `30` | HTTP-Timeout |
 | `CONFIG_APP_CLOUD_REST_JSON_BUFFER_SIZE` | `512` | JSON-Puffergrösse |
 | `CONFIG_APP_CLOUD_REST_TRACKER_ID_FALLBACK` | `nrf-tracker-unknown` | Fallback-ID wenn IMEI nicht lesbar |
+| `CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS` | `0` | Mindestgenauigkeit für Sendung (0 = immer) |
+| `CONFIG_APP_STORAGE_BACKEND_LITTLEFS` | `n` | LittleFS statt RAM-Buffer |
+| `CONFIG_PM_PARTITION_SIZE_LITTLEFS` | `0x10000` | Flash-Partition für LittleFS |
+| `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE` | `8` (RAM) / `64` (LittleFS) | Max. Records pro Datentyp |
 
 ## CI/CD mit Jenkins
 
