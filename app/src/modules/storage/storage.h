@@ -47,6 +47,14 @@ enum storage_msg_type {
 	/* Consumer finished with batch session. */
 	STORAGE_BATCH_CLOSE,
 
+	/* Acknowledge successful processing of the last peeked record.
+	 * Storage deletes the record and peeks the next one.
+	 * Set `session_id` to the active session and `data_type` to the type that was processed.
+	 * Storage responds with STORAGE_BATCH_AVAILABLE (next record) or STORAGE_BATCH_CLOSE
+	 * (no more records, session automatically closed).
+	 */
+	STORAGE_BATCH_ACK,
+
 	/* Command to print storage statistics.
 	 * The command must be enabled with CONFIG_APP_STORAGE_SHELL_STATS.
 	 */

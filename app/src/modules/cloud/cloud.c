@@ -25,6 +25,8 @@
 #include "fota.h"
 #include "network.h"
 #include "location.h"
+#include "storage.h"
+#include "storage_data_types.h"
 
 #if defined(CONFIG_APP_ENVIRONMENTAL)
 #include "environmental.h"
@@ -57,7 +59,7 @@ ZBUS_MSG_SUBSCRIBER_DEFINE(cloud_subscriber);
 #define CHANNEL_LIST(X)							\
 	X(network_chan,		struct network_msg)			\
 	X(cloud_chan,		struct cloud_msg)			\
-	X(location_chan,	struct location_msg)			\
+	X(storage_chan,		struct storage_msg)			\
 	IF_ENABLED(CONFIG_APP_ENVIRONMENTAL,				\
 		(X(environmental_chan,	struct environmental_msg)))	\
 	IF_ENABLED(CONFIG_APP_POWER,					\
@@ -87,6 +89,9 @@ static struct {
 /* Tracker ID retrieved from modem IMEI at startup */
 static char tracker_id[HW_ID_LEN];
 
+/* Watchdog channel ID — made file-scope so state handlers can feed it during batch loops */
+static int cloud_task_wdt_id = -1;
+
 /* -------------------------------------------------------------------------- */
 /* State machine declarations                                                  */
 /* -------------------------------------------------------------------------- */
@@ -105,6 +110,7 @@ struct cloud_state {
 	struct smf_ctx ctx;
 	const struct zbus_channel *chan;
 	uint8_t msg_buf[MAX_MSG_SIZE];
+	uint32_t batch_session_id;
 };
 
 static const struct smf_state states[] = {
@@ -136,6 +142,10 @@ static int http_response_cb(struct http_response *rsp,
 			    void *user_data)
 {
 	if (final_data == HTTP_DATA_FINAL) {
+		int *out_status = (int *)user_data;
+
+		*out_status = rsp->http_status_code;
+
 		if (rsp->http_status_code >= 200 && rsp->http_status_code < 300) {
 			LOG_INF("Position accepted (HTTP %d)", rsp->http_status_code);
 		} else {
@@ -146,7 +156,8 @@ static int http_response_cb(struct http_response *rsp,
 	return 0;
 }
 
-static void send_position(const struct location_data *gnss_data)
+/* Returns 0 on HTTP 2xx, -1 on any error (socket, timeout, non-2xx status). */
+static int send_position(const struct location_data *gnss_data)
 {
 	static char json_buf[CONFIG_APP_CLOUD_REST_JSON_BUFFER_SIZE];
 	static uint8_t recv_buf[256];
@@ -165,6 +176,7 @@ static void send_position(const struct location_data *gnss_data)
 
 	char timestamp[32];
 	int json_len;
+	int http_status = 0;
 	struct zsock_addrinfo hints = {
 		.ai_family   = AF_INET,
 		.ai_socktype = SOCK_STREAM,
@@ -179,7 +191,7 @@ static void send_position(const struct location_data *gnss_data)
 		LOG_INF("Fix accuracy %.1f m worse than limit %d m, skipping",
 			(double)gnss_data->accuracy,
 			CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS);
-		return;
+		return 0;  /* accuracy skip counts as success — delete from storage */
 	}
 
 	format_timestamp(timestamp, sizeof(timestamp), &gnss_data->datetime);
@@ -211,7 +223,7 @@ static void send_position(const struct location_data *gnss_data)
 
 	if (json_len < 0 || json_len >= (int)sizeof(json_buf)) {
 		LOG_ERR("JSON buffer too small (%d bytes needed)", json_len);
-		return;
+		return -1;
 	}
 
 	LOG_DBG("PUT %s  payload (%d bytes): %s", url_buf, json_len, json_buf);
@@ -222,7 +234,7 @@ static void send_position(const struct location_data *gnss_data)
 	if (err) {
 		LOG_ERR("DNS lookup for %s failed: %d",
 			CONFIG_APP_CLOUD_REST_SERVER_HOST, err);
-		return;
+		return -1;
 	}
 
 	/* Create TCP or TLS socket */
@@ -234,7 +246,7 @@ static void send_position(const struct location_data *gnss_data)
 	if (sock < 0) {
 		LOG_ERR("socket() failed: %d", errno);
 		zsock_freeaddrinfo(res);
-		return;
+		return -1;
 	}
 
 #if defined(CONFIG_APP_CLOUD_REST_TLS)
@@ -249,7 +261,7 @@ static void send_position(const struct location_data *gnss_data)
 			LOG_ERR("TLS_HOSTNAME setsockopt failed: %d", errno);
 			zsock_close(sock);
 			zsock_freeaddrinfo(res);
-			return;
+			return -1;
 		}
 
 		err = zsock_setsockopt(sock, SOL_TLS, TLS_PEER_VERIFY,
@@ -258,7 +270,7 @@ static void send_position(const struct location_data *gnss_data)
 			LOG_ERR("TLS_PEER_VERIFY setsockopt failed: %d", errno);
 			zsock_close(sock);
 			zsock_freeaddrinfo(res);
-			return;
+			return -1;
 		}
 	}
 #endif
@@ -271,7 +283,7 @@ static void send_position(const struct location_data *gnss_data)
 			CONFIG_APP_CLOUD_REST_SERVER_HOST,
 			CONFIG_APP_CLOUD_REST_SERVER_PORT, errno);
 		zsock_close(sock);
-		return;
+		return -1;
 	}
 
 	/* Send HTTP PUT using the Zephyr HTTP client stack */
@@ -292,16 +304,22 @@ static void send_position(const struct location_data *gnss_data)
 
 	err = http_client_req(sock, &req,
 			      CONFIG_APP_CLOUD_REST_HTTP_TIMEOUT_SECONDS * MSEC_PER_SEC,
-			      NULL);
+			      &http_status);
+	zsock_close(sock);
+
 	if (err < 0) {
 		LOG_ERR("http_client_req failed: %d", err);
+		return -1;
 	}
 
-	LOG_DBG("Sent position: lat=%.5f lon=%.5f acc=%dm",
-		gnss_data->latitude, gnss_data->longitude,
-		(int)gnss_data->accuracy);
+	if (http_status >= 200 && http_status < 300) {
+		LOG_DBG("Sent position: lat=%.5f lon=%.5f acc=%dm",
+			gnss_data->latitude, gnss_data->longitude,
+			(int)gnss_data->accuracy);
+		return 0;
+	}
 
-	zsock_close(sock);
+	return -1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -370,14 +388,66 @@ static enum smf_state_result state_connected_run(void *o)
 		return SMF_EVENT_PROPAGATE;
 	}
 
-	/* GNSS location data → send HTTP POST */
-	if (s->chan == &location_chan) {
-		const struct location_msg *msg = (const struct location_msg *)s->msg_buf;
+	/* Storage batch: peek-and-ack protocol — one record at a time.
+	 * Records stay in the ring buffer until explicitly ACKed after a successful HTTP send.
+	 * On failure the batch is closed; the unacknowledged record stays for the next interval.
+	 */
+	if (s->chan == &storage_chan) {
+		const struct storage_msg *smsg = (const struct storage_msg *)s->msg_buf;
 
-		if (msg->type == LOCATION_GNSS_DATA) {
-			send_position(&msg->gnss_data);
+		if (smsg->type == STORAGE_BATCH_AVAILABLE) {
+			struct storage_data_item item;
+			struct storage_msg reply = { .session_id = smsg->session_id };
+			int read_err;
+
+			s->batch_session_id = smsg->session_id;
+
+			read_err = storage_batch_read(&item, K_MSEC(500));
+			if (read_err != 0) {
+				LOG_ERR("storage_batch_read failed (%d), closing batch", read_err);
+				reply.type = STORAGE_BATCH_CLOSE;
+				zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
+				s->batch_session_id = 0;
+				return SMF_EVENT_HANDLED;
+			}
+
+			reply.data_type = item.type;
+
+			if (item.type == STORAGE_TYPE_LOCATION) {
+				const struct location_msg *loc = &item.data.LOCATION;
+
+				if (loc->type == LOCATION_GNSS_DATA &&
+				    send_position(&loc->gnss_data) != 0) {
+					/* Send failed — leave record in storage, try next interval */
+					LOG_WRN("Send failed, keeping record for retry");
+					reply.type = STORAGE_BATCH_CLOSE;
+					zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
+					s->batch_session_id = 0;
+					return SMF_EVENT_HANDLED;
+				}
+			}
+
+			/* Success (or non-position type): ACK — storage deletes record and
+			 * peeks the next one, then replies with BATCH_AVAILABLE or BATCH_CLOSE. */
+			reply.type = STORAGE_BATCH_ACK;
+			zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
+			return SMF_EVENT_HANDLED;
 		}
-		return SMF_EVENT_HANDLED;
+
+		if (smsg->type == STORAGE_BATCH_EMPTY || smsg->type == STORAGE_BATCH_ERROR) {
+			/* No records or error — close session so main.c can proceed */
+			struct storage_msg close = {
+				.type       = STORAGE_BATCH_CLOSE,
+				.session_id = smsg->session_id,
+			};
+
+			zbus_chan_pub(&storage_chan, &close, K_SECONDS(1));
+			s->batch_session_id = 0;
+			return SMF_EVENT_HANDLED;
+		}
+
+		/* STORAGE_BATCH_CLOSE from storage (auto-close after last ACK): ignore */
+		return SMF_EVENT_PROPAGATE;
 	}
 
 #if defined(CONFIG_APP_ENVIRONMENTAL)
@@ -458,7 +528,6 @@ static void task_wdt_callback(int channel_id, void *user_data)
 static void cloud_module_thread(void)
 {
 	int err;
-	int task_wdt_id;
 	const uint32_t wdt_timeout_ms =
 		(CONFIG_APP_CLOUD_WATCHDOG_TIMEOUT_SECONDS * MSEC_PER_SEC);
 	const uint32_t execution_time_ms =
@@ -499,9 +568,10 @@ static void cloud_module_thread(void)
 		return;
 	}
 
-	task_wdt_id = task_wdt_add(wdt_timeout_ms, task_wdt_callback, (void *)k_current_get());
-	if (task_wdt_id < 0) {
-		LOG_ERR("task_wdt_add, error: %d", task_wdt_id);
+	cloud_task_wdt_id = task_wdt_add(wdt_timeout_ms, task_wdt_callback,
+					  (void *)k_current_get());
+	if (cloud_task_wdt_id < 0) {
+		LOG_ERR("task_wdt_add, error: %d", cloud_task_wdt_id);
 		SEND_FATAL_ERROR();
 		return;
 	}
@@ -509,7 +579,7 @@ static void cloud_module_thread(void)
 	smf_set_initial(SMF_CTX(&cloud_state_obj), &states[STATE_DISCONNECTED]);
 
 	while (true) {
-		err = task_wdt_feed(task_wdt_id);
+		err = task_wdt_feed(cloud_task_wdt_id);
 		if (err) {
 			LOG_ERR("task_wdt_feed, error: %d", err);
 			SEND_FATAL_ERROR();
