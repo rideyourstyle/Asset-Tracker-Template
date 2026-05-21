@@ -1,13 +1,16 @@
 /*
- * Cloud REST module - sends GNSS position data to the rideyourstyle tracking REST API.
+ * Cloud REST module — sends tracker records to the rideyourstyle tracking REST API.
  *
- * This module replaces the nRF Cloud CoAP cloud module. It:
- *  - Subscribes to location_chan for GNSS position data
- *  - Optionally caches environmental (temp/pressure) and power (battery) data
- *  - POSTs position data to POST /v1/tracks/positions via plain HTTP
- *  - Publishes CLOUD_CONNECTED / CLOUD_DISCONNECTED based on network state
- *  - Stubs out the FOTA channel (FOTA is not supported without nRF Cloud)
- *  - Responds to shadow requests with "empty" responses so main.c can proceed
+ * Recording path (runs in connected AND disconnected state):
+ *   location_chan LOCATION_GNSS_DATA
+ *     → combine GNSS + cached env/battery into compact tracker_record
+ *     → publish tracker_record_chan  →  storage module persists to flash
+ *
+ * Sending path (triggered by main.c every CONFIG_APP_CLOUD_UPDATE_INTERVAL_SECONDS):
+ *   STORAGE_BATCH_AVAILABLE (one record at a time, peek-and-ack protocol)
+ *     → HTTP PUT to dev.tracking.rideyourstyle.ch
+ *     → on HTTP 2xx: STORAGE_BATCH_ACK  (record deleted from flash)
+ *     → on error:    STORAGE_BATCH_CLOSE (record kept, retry next interval)
  */
 
 #include <zephyr/kernel.h>
@@ -25,6 +28,7 @@
 #include "fota.h"
 #include "network.h"
 #include "location.h"
+#include "tracker_record.h"
 #include "storage.h"
 #include "storage_data_types.h"
 
@@ -52,6 +56,14 @@ ZBUS_CHAN_DEFINE(fota_chan,
 		ZBUS_OBSERVERS_EMPTY,
 		ZBUS_MSG_INIT(0));
 
+/* Channel published by this module: compact records ready for storage */
+ZBUS_CHAN_DEFINE(tracker_record_chan,
+		struct tracker_record,
+		NULL,
+		NULL,
+		ZBUS_OBSERVERS_EMPTY,
+		ZBUS_MSG_INIT(0));
+
 /* Register subscriber */
 ZBUS_MSG_SUBSCRIBER_DEFINE(cloud_subscriber);
 
@@ -59,6 +71,7 @@ ZBUS_MSG_SUBSCRIBER_DEFINE(cloud_subscriber);
 #define CHANNEL_LIST(X)							\
 	X(network_chan,		struct network_msg)			\
 	X(cloud_chan,		struct cloud_msg)			\
+	X(location_chan,	struct location_msg)			\
 	X(storage_chan,		struct storage_msg)			\
 	IF_ENABLED(CONFIG_APP_ENVIRONMENTAL,				\
 		(X(environmental_chan,	struct environmental_msg)))	\
@@ -124,13 +137,12 @@ static const struct smf_state states[] = {
 /* HTTP helpers                                                                */
 /* -------------------------------------------------------------------------- */
 
-static void format_timestamp(char *buf, size_t len,
-			      const struct location_datetime *dt)
+static void format_timestamp(char *buf, size_t len, const struct tracker_record *rec)
 {
-	if (dt->valid) {
+	if (rec->timestamp_valid) {
 		snprintk(buf, len, "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
-			 dt->year, dt->month, dt->day,
-			 dt->hour, dt->minute, dt->second, dt->ms);
+			 rec->year, rec->month, rec->day,
+			 rec->hour, rec->minute, rec->second, rec->ms);
 	} else {
 		strncpy(buf, "1970-01-01T00:00:00.000Z", len);
 		buf[len - 1] = '\0';
@@ -156,24 +168,16 @@ static int http_response_cb(struct http_response *rsp,
 	return 0;
 }
 
-/* Returns 0 on HTTP 2xx, -1 on any error (socket, timeout, non-2xx status). */
-static int send_position(const struct location_data *gnss_data)
+/* Send one tracker_record via HTTPS PUT.
+ * Returns 0 on HTTP 2xx, -1 on any error (socket, timeout, non-2xx status).
+ */
+static int send_record(const struct tracker_record *rec)
 {
 	static char json_buf[CONFIG_APP_CLOUD_REST_JSON_BUFFER_SIZE];
 	static uint8_t recv_buf[256];
-	/* /v1/trackers/ + tracker_id (max HW_ID_LEN) + NUL */
 	char url_buf[sizeof(CONFIG_APP_CLOUD_REST_API_PATH) + HW_ID_LEN + 2];
-
-	/* Optional headers: API key (empty string = disabled, compile-time constant) */
 	char api_key_hdr[sizeof("X-Api-Key: \r\n") + sizeof(CONFIG_APP_CLOUD_REST_API_KEY)];
 	const char *api_key_hdrs[2] = { NULL, NULL };
-
-	if (sizeof(CONFIG_APP_CLOUD_REST_API_KEY) > 1) {
-		snprintk(api_key_hdr, sizeof(api_key_hdr), "X-Api-Key: %s\r\n",
-			 CONFIG_APP_CLOUD_REST_API_KEY);
-		api_key_hdrs[0] = api_key_hdr;
-	}
-
 	char timestamp[32];
 	int json_len;
 	int http_status = 0;
@@ -186,21 +190,16 @@ static int send_position(const struct location_data *gnss_data)
 	int sock;
 	int err;
 
-	if (CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS > 0 &&
-	    gnss_data->accuracy > CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS) {
-		LOG_INF("Fix accuracy %.1f m worse than limit %d m, skipping",
-			(double)gnss_data->accuracy,
-			CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS);
-		return 0;  /* accuracy skip counts as success — delete from storage */
+	if (sizeof(CONFIG_APP_CLOUD_REST_API_KEY) > 1) {
+		snprintk(api_key_hdr, sizeof(api_key_hdr), "X-Api-Key: %s\r\n",
+			 CONFIG_APP_CLOUD_REST_API_KEY);
+		api_key_hdrs[0] = api_key_hdr;
 	}
 
-	format_timestamp(timestamp, sizeof(timestamp), &gnss_data->datetime);
+	format_timestamp(timestamp, sizeof(timestamp), rec);
 
-	/* URL: /v1/trackers/{tracker_id} */
-	snprintk(url_buf, sizeof(url_buf), "%s/%s",
-		 CONFIG_APP_CLOUD_REST_API_PATH, tracker_id);
+	snprintk(url_buf, sizeof(url_buf), "%s/%s", CONFIG_APP_CLOUD_REST_API_PATH, tracker_id);
 
-	/* Build flat JSON body (matches rideyourstyle tracker API) */
 	json_len = snprintk(json_buf, sizeof(json_buf),
 		"{"
 		"\"sampleTimestamp\":\"%s\","
@@ -214,12 +213,12 @@ static int send_position(const struct location_data *gnss_data)
 		"\"cellRssi\":0"
 		"}",
 		timestamp,
-		gnss_data->latitude,
-		gnss_data->longitude,
-		sensor_cache.has_env ? sensor_cache.pressure_pa : 0,
-		sensor_cache.has_env ? sensor_cache.temperature_celsius : 0,
-		(int)gnss_data->accuracy,
-		sensor_cache.has_battery ? sensor_cache.battery_mv : 0);
+		rec->latitude,
+		rec->longitude,
+		rec->pressure_pa,
+		rec->temperature_c,
+		(int)rec->accuracy_m,
+		rec->battery_mv);
 
 	if (json_len < 0 || json_len >= (int)sizeof(json_buf)) {
 		LOG_ERR("JSON buffer too small (%d bytes needed)", json_len);
@@ -228,16 +227,13 @@ static int send_position(const struct location_data *gnss_data)
 
 	LOG_DBG("PUT %s  payload (%d bytes): %s", url_buf, json_len, json_buf);
 
-	/* DNS lookup */
 	snprintk(port_str, sizeof(port_str), "%d", CONFIG_APP_CLOUD_REST_SERVER_PORT);
 	err = zsock_getaddrinfo(CONFIG_APP_CLOUD_REST_SERVER_HOST, port_str, &hints, &res);
 	if (err) {
-		LOG_ERR("DNS lookup for %s failed: %d",
-			CONFIG_APP_CLOUD_REST_SERVER_HOST, err);
+		LOG_ERR("DNS lookup for %s failed: %d", CONFIG_APP_CLOUD_REST_SERVER_HOST, err);
 		return -1;
 	}
 
-	/* Create TCP or TLS socket */
 #if defined(CONFIG_APP_CLOUD_REST_TLS)
 	sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TLS_1_2);
 #else
@@ -250,7 +246,6 @@ static int send_position(const struct location_data *gnss_data)
 	}
 
 #if defined(CONFIG_APP_CLOUD_REST_TLS)
-	/* TLS offload on nRF91x1 — peer verification disabled (dev/test mode) */
 	{
 		int peer_verify = TLS_PEER_VERIFY_NONE;
 
@@ -263,7 +258,6 @@ static int send_position(const struct location_data *gnss_data)
 			zsock_freeaddrinfo(res);
 			return -1;
 		}
-
 		err = zsock_setsockopt(sock, SOL_TLS, TLS_PEER_VERIFY,
 				       &peer_verify, sizeof(peer_verify));
 		if (err) {
@@ -275,7 +269,6 @@ static int send_position(const struct location_data *gnss_data)
 	}
 #endif
 
-	/* Connect */
 	err = zsock_connect(sock, res->ai_addr, res->ai_addrlen);
 	zsock_freeaddrinfo(res);
 	if (err) {
@@ -286,19 +279,18 @@ static int send_position(const struct location_data *gnss_data)
 		return -1;
 	}
 
-	/* Send HTTP PUT using the Zephyr HTTP client stack */
 	struct http_request req = {
-		.method          = HTTP_PUT,
-		.url             = url_buf,
-		.protocol        = "HTTP/1.1",
-		.host            = CONFIG_APP_CLOUD_REST_SERVER_HOST,
+		.method             = HTTP_PUT,
+		.url                = url_buf,
+		.protocol           = "HTTP/1.1",
+		.host               = CONFIG_APP_CLOUD_REST_SERVER_HOST,
 		.content_type_value = "application/json",
-		.payload         = json_buf,
-		.payload_len     = json_len,
-		.response        = http_response_cb,
-		.recv_buf        = recv_buf,
-		.recv_buf_len    = sizeof(recv_buf),
-		.optional_headers = (sizeof(CONFIG_APP_CLOUD_REST_API_KEY) > 1)
+		.payload            = json_buf,
+		.payload_len        = json_len,
+		.response           = http_response_cb,
+		.recv_buf           = recv_buf,
+		.recv_buf_len       = sizeof(recv_buf),
+		.optional_headers   = (sizeof(CONFIG_APP_CLOUD_REST_API_KEY) > 1)
 					? api_key_hdrs : NULL,
 	};
 
@@ -313,9 +305,8 @@ static int send_position(const struct location_data *gnss_data)
 	}
 
 	if (http_status >= 200 && http_status < 300) {
-		LOG_DBG("Sent position: lat=%.5f lon=%.5f acc=%dm",
-			gnss_data->latitude, gnss_data->longitude,
-			(int)gnss_data->accuracy);
+		LOG_DBG("Sent: lat=%.5f lon=%.5f acc=%dm",
+			rec->latitude, rec->longitude, (int)rec->accuracy_m);
 		return 0;
 	}
 
@@ -388,16 +379,66 @@ static enum smf_state_result state_connected_run(void *o)
 		return SMF_EVENT_PROPAGATE;
 	}
 
-	/* Storage batch: peek-and-ack protocol — one record at a time.
-	 * Records stay in the ring buffer until explicitly ACKed after a successful HTTP send.
-	 * On failure the batch is closed; the unacknowledged record stays for the next interval.
+	/* GNSS fix arrived: create compact record (GNSS + cached sensors) and store it.
+	 * Accuracy filter applied here — bad fixes are discarded without storing.
+	 * Runs in both connected and disconnected state (via SMF propagation to parent).
+	 */
+	if (s->chan == &location_chan) {
+		const struct location_msg *msg = (const struct location_msg *)s->msg_buf;
+
+		if (msg->type == LOCATION_GNSS_DATA) {
+			const struct location_data *gnss = &msg->gnss_data;
+
+			if (CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS > 0 &&
+			    gnss->accuracy > CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS) {
+				LOG_INF("Fix accuracy %.1f m > limit %d m, discarding",
+					(double)gnss->accuracy,
+					CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS);
+				return SMF_EVENT_HANDLED;
+			}
+
+			struct tracker_record rec = {
+				.latitude        = gnss->latitude,
+				.longitude       = gnss->longitude,
+				.accuracy_m      = gnss->accuracy,
+				.temperature_c   = sensor_cache.has_env
+						   ? sensor_cache.temperature_celsius : 0,
+				.pressure_pa     = sensor_cache.has_env
+						   ? sensor_cache.pressure_pa : 0,
+				.battery_mv      = sensor_cache.has_battery
+						   ? sensor_cache.battery_mv : 0,
+				.year            = gnss->datetime.year,
+				.month           = gnss->datetime.month,
+				.day             = gnss->datetime.day,
+				.hour            = gnss->datetime.hour,
+				.minute          = gnss->datetime.minute,
+				.second          = gnss->datetime.second,
+				.ms              = gnss->datetime.ms,
+				.timestamp_valid = gnss->datetime.valid ? 1u : 0u,
+			};
+
+			int pub_err = zbus_chan_pub(&tracker_record_chan, &rec, K_SECONDS(1));
+
+			if (pub_err) {
+				LOG_ERR("Failed to publish tracker_record: %d", pub_err);
+			} else {
+				LOG_DBG("Stored: lat=%.5f lon=%.5f acc=%dm",
+					rec.latitude, rec.longitude, (int)rec.accuracy_m);
+			}
+		}
+		return SMF_EVENT_HANDLED;
+	}
+
+	/* Storage batch: peek-and-ack — one record per BATCH_AVAILABLE message.
+	 * Records stay in flash until ACKed (HTTP 2xx). On failure: CLOSE keeps the record.
 	 */
 	if (s->chan == &storage_chan) {
 		const struct storage_msg *smsg = (const struct storage_msg *)s->msg_buf;
 
 		if (smsg->type == STORAGE_BATCH_AVAILABLE) {
 			struct storage_data_item item;
-			struct storage_msg reply = { .session_id = smsg->session_id };
+			struct storage_msg reply = { .session_id = smsg->session_id,
+						     .data_type  = STORAGE_TYPE_TRACKER };
 			int read_err;
 
 			s->batch_session_id = smsg->session_id;
@@ -411,31 +452,20 @@ static enum smf_state_result state_connected_run(void *o)
 				return SMF_EVENT_HANDLED;
 			}
 
-			reply.data_type = item.type;
-
-			if (item.type == STORAGE_TYPE_LOCATION) {
-				const struct location_msg *loc = &item.data.LOCATION;
-
-				if (loc->type == LOCATION_GNSS_DATA &&
-				    send_position(&loc->gnss_data) != 0) {
-					/* Send failed — leave record in storage, try next interval */
-					LOG_WRN("Send failed, keeping record for retry");
-					reply.type = STORAGE_BATCH_CLOSE;
-					zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
-					s->batch_session_id = 0;
-					return SMF_EVENT_HANDLED;
-				}
+			if (send_record(&item.data.TRACKER) != 0) {
+				LOG_WRN("Send failed, keeping record for retry");
+				reply.type = STORAGE_BATCH_CLOSE;
+				zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
+				s->batch_session_id = 0;
+				return SMF_EVENT_HANDLED;
 			}
 
-			/* Success (or non-position type): ACK — storage deletes record and
-			 * peeks the next one, then replies with BATCH_AVAILABLE or BATCH_CLOSE. */
 			reply.type = STORAGE_BATCH_ACK;
 			zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
 			return SMF_EVENT_HANDLED;
 		}
 
 		if (smsg->type == STORAGE_BATCH_EMPTY || smsg->type == STORAGE_BATCH_ERROR) {
-			/* No records or error — close session so main.c can proceed */
 			struct storage_msg close = {
 				.type       = STORAGE_BATCH_CLOSE,
 				.session_id = smsg->session_id,
@@ -446,7 +476,6 @@ static enum smf_state_result state_connected_run(void *o)
 			return SMF_EVENT_HANDLED;
 		}
 
-		/* STORAGE_BATCH_CLOSE from storage (auto-close after last ACK): ignore */
 		return SMF_EVENT_PROPAGATE;
 	}
 

@@ -14,14 +14,8 @@
 
 #include "network.h"
 
-#if IS_ENABLED(CONFIG_APP_POWER)
-#include "power.h"
-#endif
-#if IS_ENABLED(CONFIG_APP_ENVIRONMENTAL)
-#include "environmental.h"
-#endif
-#if IS_ENABLED(CONFIG_APP_LOCATION)
-#include "location.h"
+#if IS_ENABLED(CONFIG_APP_CLOUD)
+#include "tracker_record.h"
 #endif
 
 /**
@@ -61,16 +55,9 @@
  *          X(name, channel, msg_type, data_type, check_fn, extract_fn)
  */
 #define DATA_SOURCE_LIST(X)									\
-	IF_ENABLED(CONFIG_APP_POWER,								\
-		   (X(BATTERY, power_chan, struct power_msg, struct power_msg,			\
-		      battery_check, battery_extract)))						\
-	IF_ENABLED(CONFIG_APP_ENVIRONMENTAL,							\
-		   (X(ENVIRONMENTAL, environmental_chan,					\
-		      struct environmental_msg, struct environmental_msg,			\
-		      environmental_check, environmental_extract)))				\
-	IF_ENABLED(CONFIG_APP_LOCATION,								\
-		   (X(LOCATION, location_chan, struct location_msg,				\
-		      struct location_msg, location_check, location_extract)))
+	IF_ENABLED(CONFIG_APP_CLOUD,								\
+		   (X(TRACKER, tracker_record_chan, struct tracker_record,			\
+		      struct tracker_record, tracker_check, tracker_extract)))
 
 #define STORAGE_DATA_TYPE(_name)								\
 	STORAGE_TYPE_ ## _name
