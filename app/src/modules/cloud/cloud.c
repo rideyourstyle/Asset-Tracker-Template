@@ -126,6 +126,8 @@ struct cloud_state {
 	uint32_t batch_session_id;
 };
 
+static enum smf_state_result handle_common_channels(struct cloud_state *s);
+
 static const struct smf_state states[] = {
 	[STATE_DISCONNECTED] = SMF_CREATE_STATE(
 		state_disconnected_entry, state_disconnected_run, NULL, NULL, NULL),
@@ -225,7 +227,12 @@ static int send_record(const struct tracker_record *rec)
 		return -1;
 	}
 
-	LOG_DBG("PUT %s  payload (%d bytes): %s", url_buf, json_len, json_buf);
+	LOG_DBG("PUT %s (%d bytes)", url_buf, json_len);
+	LOG_DBG("  timestamp=%s", timestamp);
+	LOG_DBG("  lat=%.7f  lon=%.7f  acc=%dm",
+		rec->latitude, rec->longitude, (int)rec->accuracy_m);
+	LOG_DBG("  temp=%d°C  pressure=%dPa  battery=%dmV",
+		rec->temperature_c, rec->pressure_pa, rec->battery_mv);
 
 	snprintk(port_str, sizeof(port_str), "%d", CONFIG_APP_CLOUD_REST_SERVER_PORT);
 	err = zsock_getaddrinfo(CONFIG_APP_CLOUD_REST_SERVER_HOST, port_str, &hints, &res);
@@ -345,44 +352,18 @@ static enum smf_state_result state_disconnected_run(void *o)
 		}
 	}
 
-	return SMF_EVENT_PROPAGATE;
+	/* Record GNSS fixes and keep sensor cache fresh even when offline */
+	return handle_common_channels(s);
 }
 
-static void state_connected_entry(void *o)
+/* Handle channels that must be processed in BOTH connected and disconnected state:
+ *   - location_chan: record GNSS fix to flash (offline buffering)
+ *   - environmental_chan: update sensor cache
+ *   - power_chan: update battery cache
+ * Returns SMF_EVENT_HANDLED if the message was consumed, SMF_EVENT_PROPAGATE otherwise.
+ */
+static enum smf_state_result handle_common_channels(struct cloud_state *s)
 {
-	ARG_UNUSED(o);
-
-	LOG_INF("Cloud connected (REST mode, server: %s)",
-		CONFIG_APP_CLOUD_REST_SERVER_HOST);
-
-	struct cloud_msg msg = { .type = CLOUD_CONNECTED };
-	int err = zbus_chan_pub(&cloud_chan, &msg, K_SECONDS(1));
-
-	if (err) {
-		LOG_ERR("zbus_chan_pub CLOUD_CONNECTED, error: %d", err);
-		SEND_FATAL_ERROR();
-	}
-}
-
-static enum smf_state_result state_connected_run(void *o)
-{
-	struct cloud_state *s = (struct cloud_state *)o;
-
-	/* Network disconnect → go back to disconnected */
-	if (s->chan == &network_chan) {
-		const struct network_msg *msg = (const struct network_msg *)s->msg_buf;
-
-		if (msg->type == NETWORK_DISCONNECTED) {
-			smf_set_state(SMF_CTX(s), &states[STATE_DISCONNECTED]);
-			return SMF_EVENT_HANDLED;
-		}
-		return SMF_EVENT_PROPAGATE;
-	}
-
-	/* GNSS fix arrived: create compact record (GNSS + cached sensors) and store it.
-	 * Accuracy filter applied here — bad fixes are discarded without storing.
-	 * Runs in both connected and disconnected state (via SMF propagation to parent).
-	 */
 	if (s->chan == &location_chan) {
 		const struct location_msg *msg = (const struct location_msg *)s->msg_buf;
 
@@ -427,6 +408,79 @@ static enum smf_state_result state_connected_run(void *o)
 			}
 		}
 		return SMF_EVENT_HANDLED;
+	}
+
+#if defined(CONFIG_APP_ENVIRONMENTAL)
+	if (s->chan == &environmental_chan) {
+		const struct environmental_msg *msg =
+			(const struct environmental_msg *)s->msg_buf;
+
+		if (msg->type == ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE) {
+			sensor_cache.temperature_celsius = (int)msg->temperature;
+			sensor_cache.pressure_pa         = (int)msg->pressure;
+			sensor_cache.has_env             = true;
+			LOG_DBG("Cached env data: temp=%d°C pressure=%d Pa",
+				sensor_cache.temperature_celsius,
+				sensor_cache.pressure_pa);
+		}
+		return SMF_EVENT_HANDLED;
+	}
+#endif
+
+#if defined(CONFIG_APP_POWER)
+	if (s->chan == &power_chan) {
+		const struct power_msg *msg = (const struct power_msg *)s->msg_buf;
+
+		if (msg->type == POWER_BATTERY_PERCENTAGE_SAMPLE_RESPONSE) {
+			sensor_cache.battery_mv  = (int)(msg->voltage * 1000);
+			sensor_cache.has_battery = true;
+			LOG_DBG("Cached battery: %d mV", sensor_cache.battery_mv);
+		}
+		return SMF_EVENT_HANDLED;
+	}
+#endif
+
+	return SMF_EVENT_PROPAGATE;
+}
+
+static void state_connected_entry(void *o)
+{
+	ARG_UNUSED(o);
+
+	LOG_INF("Cloud connected (REST mode, server: %s)",
+		CONFIG_APP_CLOUD_REST_SERVER_HOST);
+
+	struct cloud_msg msg = { .type = CLOUD_CONNECTED };
+	int err = zbus_chan_pub(&cloud_chan, &msg, K_SECONDS(1));
+
+	if (err) {
+		LOG_ERR("zbus_chan_pub CLOUD_CONNECTED, error: %d", err);
+		SEND_FATAL_ERROR();
+	}
+}
+
+static enum smf_state_result state_connected_run(void *o)
+{
+	struct cloud_state *s = (struct cloud_state *)o;
+
+	/* Network disconnect → go back to disconnected */
+	if (s->chan == &network_chan) {
+		const struct network_msg *msg = (const struct network_msg *)s->msg_buf;
+
+		if (msg->type == NETWORK_DISCONNECTED) {
+			smf_set_state(SMF_CTX(s), &states[STATE_DISCONNECTED]);
+			return SMF_EVENT_HANDLED;
+		}
+		return SMF_EVENT_PROPAGATE;
+	}
+
+	/* GNSS recording and sensor cache — shared with disconnected state */
+	{
+		enum smf_state_result r = handle_common_channels(s);
+
+		if (r == SMF_EVENT_HANDLED) {
+			return SMF_EVENT_HANDLED;
+		}
 	}
 
 	/* Storage batch: peek-and-ack — one record per BATCH_AVAILABLE message.
@@ -478,37 +532,6 @@ static enum smf_state_result state_connected_run(void *o)
 
 		return SMF_EVENT_PROPAGATE;
 	}
-
-#if defined(CONFIG_APP_ENVIRONMENTAL)
-	/* Cache environmental data for next position report */
-	if (s->chan == &environmental_chan) {
-		const struct environmental_msg *msg =
-			(const struct environmental_msg *)s->msg_buf;
-
-		if (msg->type == ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE) {
-			sensor_cache.temperature_celsius = (int)msg->temperature;
-			sensor_cache.pressure_pa         = (int)msg->pressure;
-			sensor_cache.has_env             = true;
-			LOG_DBG("Cached env data: temp=%d°C pressure=%d Pa",
-				sensor_cache.temperature_celsius,
-				sensor_cache.pressure_pa);
-		}
-		return SMF_EVENT_HANDLED;
-	}
-#endif
-
-#if defined(CONFIG_APP_POWER)
-	if (s->chan == &power_chan) {
-		const struct power_msg *msg = (const struct power_msg *)s->msg_buf;
-
-		if (msg->type == POWER_BATTERY_PERCENTAGE_SAMPLE_RESPONSE) {
-			sensor_cache.battery_mv = (int)(msg->voltage * 1000);
-			sensor_cache.has_battery = true;
-			LOG_DBG("Cached battery: %d mV", sensor_cache.battery_mv);
-		}
-		return SMF_EVENT_HANDLED;
-	}
-#endif
 
 	/* Shadow/config requests: respond with empty responses so main.c can proceed
 	 * with its default configuration values.

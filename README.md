@@ -7,11 +7,14 @@ Der nRF Cloud CoAP Cloud-Stack wurde durch ein eigenes HTTPS-REST-Modul ersetzt,
 
 | Datei | Änderung |
 |---|---|
-| `project/app/src/modules/cloud/cloud.c` | Komplett ersetzt: HTTPS REST statt nRF Cloud CoAP; Peek-and-ACK Batch-Protokoll |
+| `project/app/src/modules/cloud/cloud.c` | Komplett ersetzt: HTTPS REST, Peek-and-ACK, kompakter `tracker_record` |
+| `project/app/src/modules/cloud/tracker_record.h` | Neues kompaktes Record-Struct (48 Bytes) mit allen API-Feldern |
 | `project/app/src/modules/cloud/Kconfig.cloud` | CoAP-Optionen entfernt, REST/TLS/API-Key-Konfiguration hinzugefügt |
 | `project/app/src/modules/cloud/CMakeLists.txt` | Nur noch `cloud.c` (keine CoAP-Untermodule) |
 | `project/app/src/modules/storage/storage.h` | `STORAGE_BATCH_ACK` Message-Typ hinzugefügt |
 | `project/app/src/modules/storage/storage.c` | Peek-and-ACK Protokoll: Records bleiben bis zur erfolgreichen Übertragung |
+| `project/app/src/modules/storage/storage_data_types.*` | Nur noch ein Storage-Typ: `TRACKER` (statt BATTERY/ENVIRONMENTAL/LOCATION) |
+| `project/app/src/main.c` | Sample-Timer auf Stunden-Boundaries ausgerichtet; Send-Trigger nach jedem Sample statt separatem Timer |
 | `project/app/overlay-rest.conf` | Build-Overlay: REST, LittleFS-Storage, PSM, TLS |
 | `project/app/boards/thingy91x_nrf9151_ns.overlay` | LittleFS-Partition auf 8 MB erweitert |
 
@@ -19,11 +22,14 @@ Der nRF Cloud CoAP Cloud-Stack wurde durch ein eigenes HTTPS-REST-Modul ersetzt,
 
 Aufzeichnung und Übertragung laufen unabhängig:
 
-- **Alle 60 s**: GNSS-Fix wird gesucht und bei Erfolg im externen Flash gespeichert
-- **Alle 10 min**: Alle gepufferten Fixes werden der Reihe nach (älteste zuerst) per HTTPS gesendet
-- **Kein Netz**: Aufzeichnung läuft weiter — bis zu ~7 Tage Puffer im externen Flash
-- **Nach Reconnect**: Alle gepufferten Fixes werden automatisch übertragen
-- **Peek-and-ACK**: Ein Record wird erst aus dem Flash gelöscht, wenn der Server HTTP 2xx zurückgibt. Bei Fehler bleibt er für das nächste Sendeintervall erhalten.
+- **Aufzeichnung**: GNSS-Fix alle `CONFIG_APP_SAMPLING_INTERVAL_SECONDS`, auf die volle Stunde synchronisiert (z.B. 30 s → :00, :30; 15 min → :00, :15, :30, :45)
+- **Senden**: Nach jedem abgeschlossenen Sample wird geprüft, ob `CONFIG_APP_CLOUD_UPDATE_INTERVAL_SECONDS` seit dem letzten Sende-Vorgang vergangen sind. Kein separater Send-Timer — Senden findet immer an einem Sample-Boundary statt.
+- **Erster Record**: Wird erstellt sobald die Uhrzeit nach dem Boot zum ersten Mal bekannt ist (LTE-/GNSS-Sync). Danach auf Stunden-Boundaries ausgerichtet.
+- **Kein Netz**: Aufzeichnung läuft weiter — bis zu ~14 Tage Puffer im externen Flash
+- **Nach Reconnect**: Alle gepufferten Fixes werden sofort übertragen (älteste zuerst)
+- **Peek-and-ACK**: Ein Record wird erst aus dem Flash gelöscht, wenn der Server HTTP 2xx zurückgibt. Bei Fehler bleibt er für den nächsten Versuch erhalten.
+
+`CONFIG_APP_SAMPLING_INTERVAL_SECONDS` muss ein ganzzahliger Teiler von 3600 sein — wird zur Compile-Zeit geprüft. Gültige Werte: 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 24, 30, 36, 40, 45, 60, 72, 90, 120, 150, 180, 300, 360, 600, 900, 1200, 1800, 3600.
 
 ### API-Endpunkt
 
@@ -118,16 +124,29 @@ Dann mit expliziter Serial-Nummer flashen:
 
 | Farbe | Bedeutung |
 |---|---|
-| **Blau** blinkt | GNSS-Suche läuft (alle 60 s, bis zu ~2 min) |
-| **Grün** blinkt | Daten werden gesendet (alle 10 min, HTTP-Batch) |
-| **Rot** blinkt | Kein Mobilfunknetz (Gerät wartet auf Reconnect) |
+| **Blau** blinkt | GNSS-Suche läuft |
+| **Grün** blinkt | HTTP-Batch wird gesendet |
+| **Rot** blinkt | Kein Mobilfunknetz (wartet auf Reconnect) |
 | **Lila** blinkt | FOTA-Download (nicht unterstützt in dieser Version) |
-| Keine LED | Gerät wartet auf nächsten Sampling-Zyklus |
+| Keine LED | Gerät schläft (wartet auf nächsten Sampling-Zyklus) |
 
-Typischer Ablauf:
-1. **Blau** — GNSS-Fix suchen (~30–120 s)
-2. **Keine LED** — warten (~58 s bis zum nächsten Fix)
-3. Alle 10 min kurz **Grün** — gespeicherte Fixes senden
+Typischer Ablauf (30 s Intervall, 5 min Senden):
+1. **Blau** — GNSS-Fix suchen (~2–10 s bei warmem Empfänger)
+2. **Keine LED** — CPU und Modem schlafen bis zum nächsten Boundary
+3. Nach 10 Samples kurz **Grün** — gespeicherte Fixes senden
+
+## Stromverbrauch / Schlafverhalten
+
+Das Gerät schläft während der Wartezeit zwischen Samples auf mehreren Ebenen:
+
+| Komponente | Wartezustand | Stromverbrauch |
+|---|---|---|
+| ARM Cortex-M33 | Zephyr Idle → `WFI` (Wait For Interrupt) | < 1 mA |
+| LTE-Modem | PSM (Power Saving Mode, T3324 = 0 s) | ~2–3 µA |
+| UART-Konsole | **aktiv wenn USB angeschlossen** (VBUS vorhanden) | erhöht |
+| UART-Konsole | **automatisch deaktiviert ohne USB** (`VBUS_REMOVED`) | gespart |
+
+Die UART-Konsole (`ttyACM0`) ist nur sichtbar wenn ein USB-Kabel angeschlossen ist. Im Batteriebetrieb schaltet das Power-Modul beide UARTs automatisch ab (`CONFIG_APP_POWER_DISABLE_UART_ON_VBUS_REMOVED=y`). Der Modem schläft sofort nach dem Senden in PSM und wacht erst beim nächsten Sende-Zyklus auf.
 
 ## Debuggen / Logs
 
@@ -135,7 +154,7 @@ Logs gehen über USB-Serial (`CONFIG_UART_CONSOLE=y`), **nicht über RTT**.
 
 ### Serielle Konsole (115200 Baud)
 
-Das Board meldet sich als `/dev/ttyACM0` (Logs + Shell):
+Das Board meldet sich als `/dev/ttyACM0` (Logs + Shell), solange USB angeschlossen ist:
 
 ```bash
 screen /dev/ttyACM0 115200
@@ -183,9 +202,10 @@ Alle Parameter können per Kconfig angepasst werden (in `overlay-rest.conf`):
 | `CONFIG_APP_CLOUD_REST_HTTP_TIMEOUT_SECONDS` | `30` | HTTP-Timeout |
 | `CONFIG_APP_CLOUD_REST_TRACKER_ID_OVERRIDE` | `y` | Feste Tracker-ID verwenden |
 | `CONFIG_APP_CLOUD_REST_TRACKER_ID_FALLBACK` | `90D0BE69` | Feste Tracker-ID |
-| `CONFIG_APP_SAMPLING_INTERVAL_SECONDS` | `60` | GNSS-Aufzeichnungsintervall |
-| `CONFIG_APP_CLOUD_UPDATE_INTERVAL_SECONDS` | `600` | Sendeintervall (10 min) |
-| `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE` | `10000` | Max. gepufferte Records (~7 Tage) |
+| `CONFIG_APP_SAMPLING_INTERVAL_SECONDS` | `30` | GNSS-Aufzeichnungsintervall (muss Teiler von 3600 sein) |
+| `CONFIG_APP_CLOUD_UPDATE_INTERVAL_SECONDS` | `300` | Mindestabstand zwischen zwei Sendevorgängen |
+| `CONFIG_APP_STORAGE_MAX_RECORDS_PER_TYPE` | `20000` | Max. gepufferte Records (~14 Tage) |
+| `CONFIG_APP_STORAGE_INITIAL_THRESHOLD` | `0` | Storage-Threshold deaktiviert (Senden via Zeitintervall) |
 | `CONFIG_PM_PARTITION_SIZE_LITTLEFS` | `0x800000` | Flash-Partition (8 MB) |
 | `CONFIG_LTE_PSM_REQ_RPTAU` | `00100001` | PSM-Timer: 10 min Schlaf |
 
@@ -197,8 +217,8 @@ Das Thingy:91 X hat einen **GD25LE255E (32 MB)** SPI-NOR-Flash. Die Firmware ver
 |---|---|
 | Flash-Chip | GD25LE255E, 32 MB |
 | Partition | 8 MB (`0x800000`) |
-| Kapazität | ~10 000 Records |
-| Pufferdauer | **~7 Tage** bei 60 s Intervall |
+| Kapazität | ~20 000 Records |
+| Pufferdauer | **~14 Tage** bei 30 s Intervall |
 | Stromausfall-sicher | Ja — Daten bleiben bei Neustart erhalten |
 | Sendegarantie | Peek-and-ACK: Record bleibt bis HTTP 2xx bestätigt |
 

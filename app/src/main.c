@@ -12,6 +12,8 @@
 #include <zephyr/smf.h>
 #include <zephyr/sys/reboot.h>
 
+#include <date_time.h>
+
 #include "app_common.h"
 #ifdef CONFIG_APP_INSPECT_SHELL
 #include "app_inspect.h"
@@ -57,7 +59,6 @@ enum timer_msg_type {
 	 * The timer is set to expire every CONFIG_APP_CLOUD_UPDATE_INTERVAL_SECONDS seconds,
 	 * and can be overridden from the cloud.
 	 */
-	TIMER_EXPIRED_CLOUD,
 
 	/* Configuration has changed, timers need to be restarted with new intervals.
 	 * This internal event is used to signal that interval configuration has been updated
@@ -77,6 +78,32 @@ ZBUS_CHAN_DEFINE(timer_chan,
 		 ZBUS_OBSERVERS_EMPTY,
 		 ZBUS_MSG_INIT(0)
 );
+
+/* Published once when the system clock is first synchronized.
+ * Causes WAITING states to re-enter and recalculate the aligned sample delay.
+ */
+static void date_time_evt_handler(const struct date_time_evt *evt)
+{
+	static bool clock_synced;
+
+	if (clock_synced ||
+	    (evt->type != DATE_TIME_OBTAINED_MODEM &&
+	     evt->type != DATE_TIME_OBTAINED_NTP   &&
+	     evt->type != DATE_TIME_OBTAINED_EXT)) {
+		return;
+	}
+
+	clock_synced = true;
+
+	const struct timer_msg msg = { .type = TIMER_CONFIG_CHANGED };
+	int err = zbus_chan_pub(&timer_chan, &msg, K_NO_WAIT);
+
+	if (err) {
+		LOG_WRN("Failed to publish TIMER_CONFIG_CHANGED on clock sync: %d", err);
+	} else {
+		LOG_INF("Clock synced — rescheduling sample timer to next aligned boundary");
+	}
+}
 
 enum priv_main_msg_type {
 	/* All modules have signaled that they are ready. */
@@ -123,15 +150,11 @@ ZBUS_CHAN_DEFINE(priv_main_chan,
 CHANNEL_LIST(ADD_OBSERVERS)
 
 /* Forward declarations */
-static void timer_send_data_work_fn(struct k_work *work);
 static void timer_sample_data_work_fn(struct k_work *work);
 static void timer_sample_start(uint32_t delay_sec);
-static void timer_send_data_start(uint32_t delay_sec);
 static void timer_sample_stop(void);
-static void timer_send_data_stop(void);
 
 /* Delayable work used to schedule triggers */
-static K_WORK_DELAYABLE_DEFINE(timer_send_data_work, timer_send_data_work_fn);
 static K_WORK_DELAYABLE_DEFINE(timer_sample_data_work, timer_sample_data_work_fn);
 
 /* Forward declarations of state handlers */
@@ -245,6 +268,11 @@ struct main_state {
 	 * of sample_start_time.
 	 */
 	bool first_sample_pending;
+
+	/* Fire the very first send immediately after the first GNSS fix, regardless of
+	 * sync_start_time. Cleared after the first send.
+	 */
+	bool first_send_pending;
 
 	/* Start time of the most recent cloud sync. This is used to calculate the correct
 	 * time when scheduling the next cloud sync trigger.
@@ -560,44 +588,52 @@ static void trigger_sampling(struct main_state *state_object)
 	}
 }
 
+/* Calculate seconds until the next aligned sample boundary.
+ *
+ * With a 15-minute interval, samples fire at :00, :15, :30, :45 of each hour.
+ * Requires a synced clock (date_time_now). Falls back to the raw interval if
+ * the clock is not yet synchronized.
+ */
+BUILD_ASSERT((3600 % CONFIG_APP_SAMPLING_INTERVAL_SECONDS) == 0,
+	     "CONFIG_APP_SAMPLING_INTERVAL_SECONDS must be an exact divisor of 3600 "
+	     "(valid values: 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 24, 30, 36, 40, 45, "
+	     "60, 72, 90, 120, 150, 180, 300, 360, 600, 900, 1200, 1800, 3600)");
+
+/* Calculate seconds until the next aligned sample boundary.
+ *
+ * With a 15-minute interval, samples fire at :00, :15, :30, :45 of each hour.
+ *
+ * If the clock is not yet synced: returns 0 so the first sample starts immediately.
+ * The date_time callback (date_time_evt_handler) will fire TIMER_CONFIG_CHANGED
+ * once the clock syncs, causing a re-evaluation with the correct aligned delay.
+ */
+static uint32_t aligned_sample_delay(uint32_t interval_sec)
+{
+	int64_t now_ms;
+
+	if (date_time_now(&now_ms) != 0) {
+		/* Clock not synced yet — sample immediately; callback will realign later */
+		return 0;
+	}
+
+	int64_t now_s  = now_ms / 1000;
+	int64_t offset = now_s % (int64_t)interval_sec;
+
+	/* offset == 0: exactly on a boundary → wait full interval before next sample */
+	return (offset == 0) ? interval_sec
+			     : (uint32_t)((int64_t)interval_sec - offset);
+}
+
 static void waiting_entry_common(const struct main_state *state_object)
 {
-	uint32_t time_elapsed;
 	uint32_t time_remaining;
 
-	/* Reschedule the next sample trigger */
+	/* Reschedule the next sample trigger, aligned to clock boundaries */
+	time_remaining = aligned_sample_delay(state_object->sample_interval_sec);
 
-	if (state_object->first_sample_pending) {
-		time_remaining = 0;
-	} else {
-		time_elapsed = k_uptime_seconds() - state_object->sample_start_time;
-
-		if (time_elapsed > state_object->sample_interval_sec) {
-			LOG_WRN("Sampling took longer than the interval, time_elapsed: %d, "
-				"interval: %d",
-				time_elapsed, state_object->sample_interval_sec);
-			time_remaining = 0;
-		} else {
-			time_remaining = state_object->sample_interval_sec - time_elapsed;
-		}
-	}
-
-	LOG_DBG("Next sample trigger in %d seconds", time_remaining);
+	LOG_DBG("Next sample trigger in %d seconds (aligned)", time_remaining);
 
 	timer_sample_start(time_remaining);
-
-	/* Reschedule cloud sync trigger */
-	time_elapsed = k_uptime_seconds() - state_object->sync_start_time;
-	if (time_elapsed > state_object->update_interval_sec) {
-		LOG_WRN("Cloud sync took longer than the update interval, time_elapsed: %d, "
-			"interval: %d",
-			time_elapsed, state_object->update_interval_sec);
-		time_remaining = 0;
-	} else {
-		time_remaining = state_object->update_interval_sec - time_elapsed;
-	}
-	LOG_DBG("Next cloud sync trigger in %d seconds", time_remaining);
-	timer_send_data_start(time_remaining);
 }
 
 static void waiting_exit_common(void)
@@ -625,12 +661,11 @@ static void storage_send_data(struct main_state *state_object)
 	}
 }
 
-/* Send stored data now, poll cloud/FOTA, and restart cloud send timer */
+/* Send all stored data and record the send time for the next interval check. */
 static void cloud_send_now(struct main_state *state_object)
 {
 	storage_send_data(state_object);
 	poll_triggers_send();
-	timer_send_data_start(state_object->update_interval_sec);
 	state_object->sync_start_time = k_uptime_seconds();
 
 #if defined(CONFIG_APP_LED)
@@ -654,23 +689,6 @@ static void cloud_send_now(struct main_state *state_object)
 		return;
 	}
 #endif /* CONFIG_APP_LED */
-}
-
-/* Delayable work used to send messages on the timer_chan */
-static void timer_send_data_work_fn(struct k_work *work)
-{
-	int err;
-	const struct timer_msg msg = { .type = TIMER_EXPIRED_CLOUD };
-
-	ARG_UNUSED(work);
-
-	err = zbus_chan_pub(&timer_chan, &msg, PUB_TIMEOUT);
-	if (err) {
-		LOG_ERR("Failed to publish cloud timer expired message, error: %d", err);
-		SEND_FATAL_ERROR();
-
-		return;
-	}
 }
 
 static void timer_sample_data_work_fn(struct k_work *work)
@@ -702,19 +720,6 @@ static void timer_sample_start(uint32_t delay_sec)
 	}
 }
 
-static void timer_send_data_start(uint32_t delay_sec)
-{
-	int err;
-
-	err = k_work_reschedule(&timer_send_data_work, K_SECONDS(delay_sec));
-	if (err < 0) {
-		LOG_ERR("k_work_reschedule timer_send_data_work, error: %d", err);
-		SEND_FATAL_ERROR();
-
-		return;
-	}
-}
-
 static void timer_sample_stop(void)
 {
 	int err;
@@ -722,16 +727,6 @@ static void timer_sample_stop(void)
 	err = k_work_cancel_delayable(&timer_sample_data_work);
 	if (err < 0) {
 		LOG_ERR("k_work_cancel_delayable timer_sample_data_work, error: %d", err);
-	}
-}
-
-static void timer_send_data_stop(void)
-{
-	int err;
-
-	err = k_work_cancel_delayable(&timer_send_data_work);
-	if (err < 0) {
-		LOG_ERR("k_work_cancel_delayable timer_send_data_work, error: %d", err);
 	}
 }
 
@@ -1033,13 +1028,8 @@ static enum smf_state_result waiting_for_modules_init_run(void *o)
 
 static void running_entry(void *o)
 {
-	struct main_state *state_object = (struct main_state *)o;
-
 	ARG_UNUSED(o);
 	LOG_DBG("%s", __func__);
-
-	timer_send_data_start(state_object->update_interval_sec);
-	state_object->sync_start_time = k_uptime_seconds();
 }
 
 static enum smf_state_result running_run(void *o)
@@ -1081,7 +1071,6 @@ static void running_exit(void *o)
 	LOG_DBG("%s", __func__);
 
 	timer_sample_stop();
-	timer_send_data_stop();
 }
 
 /* STATE_DISCONNECTED */
@@ -1110,19 +1099,7 @@ static enum smf_state_result disconnected_run(void *o)
 		}
 	}
 
-	/* Restart cloud send timer while disconnected */
-	if (state_object->chan == &timer_chan) {
-		const struct timer_msg *msg = (const struct timer_msg *)state_object->msg_buf;
-
-		if (msg->type == TIMER_EXPIRED_CLOUD) {
-			timer_send_data_start(state_object->update_interval_sec);
-			state_object->sync_start_time = k_uptime_seconds();
-
-			return SMF_EVENT_HANDLED;
-		}
-	}
-
-	/* Ignore send trigers when disconnected */
+	/* Ignore send triggers when disconnected */
 	if (state_object->chan == &button_chan) {
 		const struct button_msg *msg = (const struct button_msg *)state_object->msg_buf;
 
@@ -1209,17 +1186,6 @@ static enum smf_state_result connected_run(void *o)
 		}
 	}
 
-	/* Handle periodic send at connectivity parent level */
-	if (state_object->chan == &timer_chan) {
-		const struct timer_msg *msg = (const struct timer_msg *)state_object->msg_buf;
-
-		if (msg->type == TIMER_EXPIRED_CLOUD) {
-			smf_set_state(SMF_CTX(state_object), &states[STATE_CONNECTED_SENDING]);
-
-			return SMF_EVENT_HANDLED;
-		}
-	}
-
 	/* Handle long button press to send immediately */
 	if (state_object->chan == &button_chan) {
 		const struct button_msg *msg = (const struct button_msg *)state_object->msg_buf;
@@ -1238,6 +1204,34 @@ static enum smf_state_result connected_run(void *o)
 		if (msg->type == STORAGE_THRESHOLD_REACHED) {
 			smf_set_state(SMF_CTX(state_object), &states[STATE_CONNECTED_SENDING]);
 
+			return SMF_EVENT_HANDLED;
+		}
+	}
+
+	/* Fallback: LOCATION_SEARCH_DONE received in an unexpected connected sub-state.
+	 * This happens when LTE connects while a GNSS search is already in progress —
+	 * the state machine transitions away from STATE_DISCONNECTED_SAMPLING before
+	 * the fix arrives, so connected_sampling_run() never sees the result.
+	 * Apply the same send-or-wait logic here so the fix is not silently dropped.
+	 */
+	if (state_object->chan == &location_chan) {
+		const struct location_msg *msg = (const struct location_msg *)state_object->msg_buf;
+
+		if (msg->type == LOCATION_SEARCH_DONE) {
+			uint32_t elapsed = k_uptime_seconds() - state_object->sync_start_time;
+			bool send_now = state_object->first_send_pending ||
+					elapsed >= state_object->update_interval_sec;
+
+			if (send_now) {
+				LOG_DBG("LOCATION_SEARCH_DONE in connected parent — sending now");
+				state_object->first_send_pending = false;
+				smf_set_state(SMF_CTX(state_object),
+					      &states[STATE_CONNECTED_SENDING]);
+			} else {
+				LOG_DBG("LOCATION_SEARCH_DONE in connected parent — waiting");
+				smf_set_state(SMF_CTX(state_object),
+					      &states[STATE_CONNECTED_WAITING]);
+			}
 			return SMF_EVENT_HANDLED;
 		}
 	}
@@ -1376,7 +1370,26 @@ static enum smf_state_result connected_sampling_run(void *o)
 		const struct location_msg *msg = (const struct location_msg *)state_object->msg_buf;
 
 		if (msg->type == LOCATION_SEARCH_DONE) {
-			smf_set_state(SMF_CTX(state_object), &states[STATE_CONNECTED_WAITING]);
+			uint32_t elapsed = k_uptime_seconds() - state_object->sync_start_time;
+			bool send_now = state_object->first_send_pending ||
+					elapsed >= state_object->update_interval_sec;
+
+			if (send_now) {
+				if (state_object->first_send_pending) {
+					LOG_DBG("First fix — sending immediately");
+					state_object->first_send_pending = false;
+				} else {
+					LOG_DBG("Send interval elapsed (%u s >= %u s), sending",
+						elapsed, state_object->update_interval_sec);
+				}
+				smf_set_state(SMF_CTX(state_object),
+					      &states[STATE_CONNECTED_SENDING]);
+			} else {
+				LOG_DBG("Next send in %u s",
+					state_object->update_interval_sec - elapsed);
+				smf_set_state(SMF_CTX(state_object),
+					      &states[STATE_CONNECTED_WAITING]);
+			}
 			return SMF_EVENT_HANDLED;
 		}
 	}
@@ -1798,6 +1811,10 @@ int main(void)
 	main_state.update_interval_sec = CONFIG_APP_CLOUD_UPDATE_INTERVAL_SECONDS;
 	main_state.storage_threshold = CONFIG_APP_STORAGE_INITIAL_THRESHOLD;
 	main_state.first_sample_pending = true;
+	main_state.first_send_pending = true;
+
+	/* Reschedule sample timer to aligned boundary when clock is first synced */
+	date_time_register_handler(date_time_evt_handler);
 
 	LOG_DBG("Main has started");
 
