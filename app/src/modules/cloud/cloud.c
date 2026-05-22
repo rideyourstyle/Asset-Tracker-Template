@@ -170,8 +170,179 @@ static int http_response_cb(struct http_response *rsp,
 	return 0;
 }
 
+/* Find integer value for "key" in a JSON string. Returns 0 on success. */
+static int json_find_int(const char *json, const char *key, int32_t *out)
+{
+	char needle[48];
+	const char *p;
+
+	snprintk(needle, sizeof(needle), "\"%s\":", key);
+	p = strstr(json, needle);
+	if (!p) {
+		return -ENOENT;
+	}
+	p += strlen(needle);
+	while (*p == ' ') {
+		p++;
+	}
+	if (*p < '0' || *p > '9') {
+		return -EINVAL;
+	}
+	*out = 0;
+	while (*p >= '0' && *p <= '9') {
+		*out = *out * 10 + (*p - '0');
+		p++;
+	}
+	return 0;
+}
+
+/* Fetch new config from server and publish CLOUD_CONFIG_UPDATE.
+ * Called when the status PUT response contains "fetchConfig":true.
+ * Uses GET /trackers/{id}/config?ack=true so the server marks the config as fetched.
+ */
+static void fetch_and_apply_config(void)
+{
+	static uint8_t cfg_recv_buf[512];
+	char url_buf[sizeof(CONFIG_APP_CLOUD_REST_API_PATH) + HW_ID_LEN +
+		     sizeof("/config?ack=true") + 2];
+	char api_key_hdr[sizeof("X-Api-Key: \r\n") + sizeof(CONFIG_APP_CLOUD_REST_API_KEY)];
+	const char *api_key_hdrs[2] = { NULL, NULL };
+	int http_status = 0;
+	struct zsock_addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+	struct zsock_addrinfo *res;
+	char port_str[8];
+	int sock;
+	int err;
+
+	if (sizeof(CONFIG_APP_CLOUD_REST_API_KEY) > 1) {
+		snprintk(api_key_hdr, sizeof(api_key_hdr), "X-Api-Key: %s\r\n",
+			 CONFIG_APP_CLOUD_REST_API_KEY);
+		api_key_hdrs[0] = api_key_hdr;
+	}
+
+	snprintk(url_buf, sizeof(url_buf), "%s/%s/config?ack=true",
+		 CONFIG_APP_CLOUD_REST_API_PATH, tracker_id);
+
+	snprintk(port_str, sizeof(port_str), "%d", CONFIG_APP_CLOUD_REST_SERVER_PORT);
+	err = zsock_getaddrinfo(CONFIG_APP_CLOUD_REST_SERVER_HOST, port_str, &hints, &res);
+	if (err) {
+		LOG_ERR("fetch_config: DNS lookup failed: %d", err);
+		return;
+	}
+
+#if defined(CONFIG_APP_CLOUD_REST_TLS)
+	sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TLS_1_2);
+#else
+	sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TCP);
+#endif
+	if (sock < 0) {
+		LOG_ERR("fetch_config: socket() failed: %d", errno);
+		zsock_freeaddrinfo(res);
+		return;
+	}
+
+#if defined(CONFIG_APP_CLOUD_REST_TLS)
+	{
+		int peer_verify = TLS_PEER_VERIFY_NONE;
+
+		err = zsock_setsockopt(sock, SOL_TLS, TLS_HOSTNAME,
+				       CONFIG_APP_CLOUD_REST_SERVER_HOST,
+				       sizeof(CONFIG_APP_CLOUD_REST_SERVER_HOST) - 1);
+		if (err) {
+			LOG_ERR("fetch_config: TLS_HOSTNAME failed: %d", errno);
+			zsock_close(sock);
+			zsock_freeaddrinfo(res);
+			return;
+		}
+		err = zsock_setsockopt(sock, SOL_TLS, TLS_PEER_VERIFY,
+				       &peer_verify, sizeof(peer_verify));
+		if (err) {
+			LOG_ERR("fetch_config: TLS_PEER_VERIFY failed: %d", errno);
+			zsock_close(sock);
+			zsock_freeaddrinfo(res);
+			return;
+		}
+	}
+#endif
+
+	err = zsock_connect(sock, res->ai_addr, res->ai_addrlen);
+	zsock_freeaddrinfo(res);
+	if (err) {
+		LOG_ERR("fetch_config: connect() failed: %d", errno);
+		zsock_close(sock);
+		return;
+	}
+
+	memset(cfg_recv_buf, 0, sizeof(cfg_recv_buf));
+
+	struct http_request req = {
+		.method           = HTTP_GET,
+		.url              = url_buf,
+		.protocol         = "HTTP/1.1",
+		.host             = CONFIG_APP_CLOUD_REST_SERVER_HOST,
+		.response         = http_response_cb,
+		.recv_buf         = cfg_recv_buf,
+		.recv_buf_len     = sizeof(cfg_recv_buf),
+		.optional_headers = (sizeof(CONFIG_APP_CLOUD_REST_API_KEY) > 1)
+					? api_key_hdrs : NULL,
+	};
+
+	err = http_client_req(sock, &req,
+			      CONFIG_APP_CLOUD_REST_HTTP_TIMEOUT_SECONDS * MSEC_PER_SEC,
+			      &http_status);
+	zsock_close(sock);
+
+	if (err < 0 || http_status < 200 || http_status >= 300) {
+		LOG_WRN("fetch_config: failed (err=%d, HTTP=%d)", err, http_status);
+		return;
+	}
+
+	const char *body = strstr((char *)cfg_recv_buf, "{");
+
+	if (!body) {
+		LOG_WRN("fetch_config: no JSON body in response");
+		return;
+	}
+
+	int32_t sample_interval = 0;
+	int32_t transmit_interval = 0;
+
+	json_find_int(body, "sampleInterval", &sample_interval);
+	json_find_int(body, "transmitInterval", &transmit_interval);
+
+	LOG_INF("Config fetched: sampleInterval=%d s, transmitInterval=%d s",
+		sample_interval, transmit_interval);
+
+	if (sample_interval > 0 && (3600 % sample_interval) != 0) {
+		LOG_WRN("fetch_config: sampleInterval=%d not a divisor of 3600, ignoring",
+			sample_interval);
+		sample_interval = 0;
+	}
+
+	if (sample_interval == 0 && transmit_interval == 0) {
+		LOG_DBG("fetch_config: no actionable values in response");
+		return;
+	}
+
+	struct cloud_msg update = {
+		.type = CLOUD_CONFIG_UPDATE,
+		.config = {
+			.sample_interval_sec   = (uint32_t)sample_interval,
+			.transmit_interval_sec = (uint32_t)transmit_interval,
+		},
+	};
+
+	int pub_err = zbus_chan_pub(&cloud_chan, &update, K_SECONDS(1));
+
+	if (pub_err) {
+		LOG_ERR("fetch_config: failed to publish CLOUD_CONFIG_UPDATE: %d", pub_err);
+	}
+}
+
 /* Send one tracker_record via HTTPS PUT.
- * Returns 0 on HTTP 2xx, -1 on any error (socket, timeout, non-2xx status).
+ * Returns  0: success, no config fetch needed
+ * Returns  1: success, server signalled fetchConfig:true
+ * Returns -1: error (socket, timeout, non-2xx)
  */
 static int send_record(const struct tracker_record *rec)
 {
@@ -314,10 +485,26 @@ static int send_record(const struct tracker_record *rec)
 	if (http_status >= 200 && http_status < 300) {
 		LOG_DBG("Sent: lat=%.5f lon=%.5f acc=%dm",
 			rec->latitude, rec->longitude, (int)rec->accuracy_m);
-		return 0;
+
+		/* Check if the server wants us to fetch a new config */
+		bool fetch_config = strstr((char *)recv_buf, "\"fetchConfig\":true") != NULL ||
+				    strstr((char *)recv_buf, "\"fetchConfig\": true") != NULL;
+
+		return fetch_config ? 1 : 0;
 	}
 
 	return -1;
+}
+
+/* Fetch config from server on first connect — cloud config is the primary source.
+ * Compile-time values (CONFIG_APP_SAMPLING_INTERVAL_SECONDS etc.) act as fallback
+ * until this call succeeds. Uses ?ack=true to acknowledge any pending config change.
+ * Best-effort: failures are logged but do not block normal operation.
+ */
+static void fetch_initial_config(void)
+{
+	LOG_INF("Fetching initial config from server (compile-time values are fallback)");
+	fetch_and_apply_config();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -445,17 +632,30 @@ static enum smf_state_result handle_common_channels(struct cloud_state *s)
 
 static void state_connected_entry(void *o)
 {
+	static bool initial_config_fetched;
+
 	ARG_UNUSED(o);
 
 	LOG_INF("Cloud connected (REST mode, server: %s)",
 		CONFIG_APP_CLOUD_REST_SERVER_HOST);
 
+	/* Publish CLOUD_CONNECTED first so main.c transitions to STATE_CONNECTED
+	 * before CLOUD_CONFIG_UPDATE arrives (fetch_initial_config publishes it).
+	 */
 	struct cloud_msg msg = { .type = CLOUD_CONNECTED };
 	int err = zbus_chan_pub(&cloud_chan, &msg, K_SECONDS(1));
 
 	if (err) {
 		LOG_ERR("zbus_chan_pub CLOUD_CONNECTED, error: %d", err);
 		SEND_FATAL_ERROR();
+	}
+
+	/* Fetch cloud config once per boot. Compile-time values are the fallback
+	 * until the server responds successfully.
+	 */
+	if (!initial_config_fetched) {
+		initial_config_fetched = true;
+		fetch_initial_config();
 	}
 }
 
@@ -506,11 +706,21 @@ static enum smf_state_result state_connected_run(void *o)
 				return SMF_EVENT_HANDLED;
 			}
 
-			if (send_record(&item.data.TRACKER) != 0) {
+			int send_result = send_record(&item.data.TRACKER);
+
+			if (send_result < 0) {
 				LOG_WRN("Send failed, keeping record for retry");
 				reply.type = STORAGE_BATCH_CLOSE;
 				zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
 				s->batch_session_id = 0;
+				return SMF_EVENT_HANDLED;
+			}
+
+			if (send_result == 1) {
+				/* Server signalled fetchConfig:true — fetch after ACK */
+				reply.type = STORAGE_BATCH_ACK;
+				zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
+				fetch_and_apply_config();
 				return SMF_EVENT_HANDLED;
 			}
 

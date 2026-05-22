@@ -127,6 +127,19 @@ enum cloud_msg_type {
 	 * reprovision devices with new credentials when the old ones expire or need rotation.
 	 */
 	CLOUD_PROVISIONING_REQUEST,
+
+	/* Server signalled that a new config is available (fetchConfig: true in status response).
+	 * cloud.c fetches GET /trackers/{id}/config?ack=true and publishes this message with the
+	 * new values. main.c applies the new intervals and restarts the sample timer.
+	 * 0 in either field means "no change".
+	 */
+	CLOUD_CONFIG_UPDATE,
+};
+
+/** New config values received from the server via GET /trackers/{id}/config?ack=true. */
+struct cloud_config {
+	uint32_t sample_interval_sec;
+	uint32_t transmit_interval_sec;
 };
 
 struct cloud_msg {
@@ -143,6 +156,11 @@ struct cloud_msg {
 		 *  CLOUD_SHADOW_RESPONSE_DELTA events.
 		 */
 		struct cloud_shadow_response response;
+
+		/** New config received from the server.
+		 *  Valid for CLOUD_CONFIG_UPDATE events.
+		 */
+		struct cloud_config config;
 	};
 };
 

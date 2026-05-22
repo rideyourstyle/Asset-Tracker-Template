@@ -1186,6 +1186,43 @@ static enum smf_state_result connected_run(void *o)
 		}
 	}
 
+	/* Handle remote config update (fetchConfig flow from server) */
+	if (state_object->chan == &cloud_chan) {
+		const struct cloud_msg *cmsg = (const struct cloud_msg *)state_object->msg_buf;
+
+		if (cmsg->type == CLOUD_CONFIG_UPDATE) {
+			bool changed = false;
+
+			if (cmsg->config.sample_interval_sec > 0 &&
+			    cmsg->config.sample_interval_sec != state_object->sample_interval_sec) {
+				LOG_INF("Sample interval: %u → %u s",
+					state_object->sample_interval_sec,
+					cmsg->config.sample_interval_sec);
+				state_object->sample_interval_sec =
+					cmsg->config.sample_interval_sec;
+				changed = true;
+			}
+
+			if (cmsg->config.transmit_interval_sec > 0 &&
+			    cmsg->config.transmit_interval_sec != state_object->update_interval_sec) {
+				LOG_INF("Transmit interval: %u → %u s",
+					state_object->update_interval_sec,
+					cmsg->config.transmit_interval_sec);
+				state_object->update_interval_sec =
+					cmsg->config.transmit_interval_sec;
+				changed = true;
+			}
+
+			if (changed) {
+				const struct timer_msg tmsg = { .type = TIMER_CONFIG_CHANGED };
+
+				zbus_chan_pub(&timer_chan, &tmsg, PUB_TIMEOUT);
+			}
+
+			return SMF_EVENT_HANDLED;
+		}
+	}
+
 	/* Handle long button press to send immediately */
 	if (state_object->chan == &button_chan) {
 		const struct button_msg *msg = (const struct button_msg *)state_object->msg_buf;
