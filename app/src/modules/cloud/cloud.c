@@ -604,7 +604,8 @@ static enum smf_state_result handle_common_channels(struct cloud_state *s)
 
 		if (msg->type == ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE) {
 			sensor_cache.temperature_celsius = (int)msg->temperature;
-			sensor_cache.pressure_pa         = (int)msg->pressure;
+			/* BME680 driver reports SENSOR_CHAN_PRESS in kPa; convert to Pa */
+			sensor_cache.pressure_pa         = (int)(msg->pressure * 1000.0);
 			sensor_cache.has_env             = true;
 			LOG_DBG("Cached env data: temp=%d°C pressure=%d Pa",
 				sensor_cache.temperature_celsius,

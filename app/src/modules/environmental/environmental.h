@@ -45,7 +45,7 @@ struct environmental_msg {
 	/** Contains the current humidity in percentage. */
 	double humidity;
 
-	/** Contains the current pressure in Pa. */
+	/** Contains the current pressure in kPa (Zephyr SENSOR_CHAN_PRESS unit for BME680). */
 	double pressure;
 
 	/** Timestamp when the sample was taken in milliseconds.
