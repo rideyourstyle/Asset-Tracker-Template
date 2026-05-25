@@ -557,14 +557,6 @@ static enum smf_state_result handle_common_channels(struct cloud_state *s)
 		if (msg->type == LOCATION_GNSS_DATA) {
 			const struct location_data *gnss = &msg->gnss_data;
 
-			if (CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS > 0 &&
-			    gnss->accuracy > CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS) {
-				LOG_INF("Fix accuracy %.1f m > limit %d m, discarding",
-					(double)gnss->accuracy,
-					CONFIG_APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS);
-				return SMF_EVENT_HANDLED;
-			}
-
 			struct tracker_record rec = {
 				.latitude        = gnss->latitude,
 				.longitude       = gnss->longitude,

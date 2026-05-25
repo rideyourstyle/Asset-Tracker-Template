@@ -78,14 +78,6 @@ config APP_CLOUD_REST_TLS
 	  Peer certificate verification is disabled (suitable for dev/test without
 	  provisioning a CA certificate into the modem).
 
-config APP_CLOUD_REST_GNSS_MIN_ACCURACY_METERS
-	int "Minimum GNSS accuracy to send a position (0 = send always)"
-	default 0
-	help
-	  If non-zero, positions with an accuracy (1-sigma) worse than this
-	  value in metres are discarded and not sent to the server.
-	  Example: 30 means only fixes with accuracy <= 30 m are sent.
-
 config APP_CLOUD_REST_HTTP_TIMEOUT_SECONDS
 	int "HTTP request timeout in seconds"
 	default 30
