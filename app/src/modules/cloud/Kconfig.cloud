@@ -50,16 +50,10 @@ config APP_CLOUD_REST_API_PATH
 
 config APP_CLOUD_REST_TRACKER_ID_FALLBACK
 	string "Fallback tracker ID"
-	default "nrf-tracker-unknown"
+	default "UNKNOWN"
 	help
 	  Tracker ID used when hw_id_get() fails to retrieve the modem IMEI.
-	  Normally the IMEI is used automatically.
-
-config APP_CLOUD_REST_TRACKER_ID_OVERRIDE
-	bool "Override tracker ID"
-	help
-	  If enabled, APP_CLOUD_REST_TRACKER_ID_FALLBACK is always used as the
-	  tracker ID, ignoring the modem IMEI. Useful for testing.
+	  Normally the last 8 digits of the IMEI are used automatically.
 
 config APP_CLOUD_REST_API_KEY
 	string "API key for request authentication"

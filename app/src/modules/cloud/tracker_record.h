@@ -1,7 +1,7 @@
 /*
  * Compact record of all fields needed for one API PUT request.
  * Captured at GNSS sampling time (sensor values snapshotted from cache).
- * sizeof(struct tracker_record) == 48 bytes.
+ * sizeof(struct tracker_record) == 48 bytes (battery_soc sits in former padding).
  */
 
 #ifndef TRACKER_RECORD_H_
@@ -34,6 +34,10 @@ struct tracker_record {
 	uint8_t  minute;
 	uint8_t  second;
 	uint8_t  timestamp_valid;  /* 1 = real clock, 0 = unknown */
+
+	/* Placed last so earlier fields stay at the same offsets as before.
+	 * -1 = not available, 0–100 = State of Charge in %. */
+	int8_t   battery_soc;
 };
 
 /* Published by cloud.c when a new GNSS fix is combined with the sensor cache.

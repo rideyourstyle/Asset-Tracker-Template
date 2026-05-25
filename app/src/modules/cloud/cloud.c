@@ -96,11 +96,13 @@ static struct {
 	int pressure_pa;
 	bool has_env;
 	int battery_mv;
+	int battery_soc;  /* 0–100 %, -1 if not yet received */
 	bool has_battery;
 } sensor_cache;
 
-/* Tracker ID retrieved from modem IMEI at startup */
-static char tracker_id[HW_ID_LEN];
+/* Tracker ID: last 8 digits of the modem IMEI (unique serial number portion) */
+#define TRACKER_ID_LEN 9  /* 8 chars + null */
+static char tracker_id[TRACKER_ID_LEN];
 
 /* Watchdog channel ID — made file-scope so state handlers can feed it during batch loops */
 static int cloud_task_wdt_id = -1;
@@ -203,7 +205,7 @@ static int json_find_int(const char *json, const char *key, int32_t *out)
 static void fetch_and_apply_config(void)
 {
 	static uint8_t cfg_recv_buf[512];
-	char url_buf[sizeof(CONFIG_APP_CLOUD_REST_API_PATH) + HW_ID_LEN +
+	char url_buf[sizeof(CONFIG_APP_CLOUD_REST_API_PATH) + TRACKER_ID_LEN +
 		     sizeof("/config?ack=true") + 2];
 	char api_key_hdr[sizeof("X-Api-Key: \r\n") + sizeof(CONFIG_APP_CLOUD_REST_API_KEY)];
 	const char *api_key_hdrs[2] = { NULL, NULL };
@@ -348,7 +350,7 @@ static int send_record(const struct tracker_record *rec)
 {
 	static char json_buf[CONFIG_APP_CLOUD_REST_JSON_BUFFER_SIZE];
 	static uint8_t recv_buf[256];
-	char url_buf[sizeof(CONFIG_APP_CLOUD_REST_API_PATH) + HW_ID_LEN + 2];
+	char url_buf[sizeof(CONFIG_APP_CLOUD_REST_API_PATH) + TRACKER_ID_LEN + 2];
 	char api_key_hdr[sizeof("X-Api-Key: \r\n") + sizeof(CONFIG_APP_CLOUD_REST_API_KEY)];
 	const char *api_key_hdrs[2] = { NULL, NULL };
 	char timestamp[32];
@@ -373,6 +375,12 @@ static int send_record(const struct tracker_record *rec)
 
 	snprintk(url_buf, sizeof(url_buf), "%s/%s", CONFIG_APP_CLOUD_REST_API_PATH, tracker_id);
 
+	char soc_field[24] = "";
+
+	if (rec->battery_soc >= 0) {
+		snprintk(soc_field, sizeof(soc_field), ",\"batterySoc\":%d", rec->battery_soc);
+	}
+
 	json_len = snprintk(json_buf, sizeof(json_buf),
 		"{"
 		"\"sampleTimestamp\":\"%s\","
@@ -382,8 +390,8 @@ static int send_record(const struct tracker_record *rec)
 		"\"speed\":0,"
 		"\"temperature\":%d,"
 		"\"gnssAcc\":%d,"
-		"\"battery\":%d,"
-		"\"cellRssi\":0"
+		"\"battery\":%d"
+		"%s"
 		"}",
 		timestamp,
 		rec->latitude,
@@ -391,7 +399,8 @@ static int send_record(const struct tracker_record *rec)
 		rec->pressure_pa,
 		rec->temperature_c,
 		(int)rec->accuracy_m,
-		rec->battery_mv);
+		rec->battery_mv,
+		soc_field);
 
 	if (json_len < 0 || json_len >= (int)sizeof(json_buf)) {
 		LOG_ERR("JSON buffer too small (%d bytes needed)", json_len);
@@ -402,8 +411,8 @@ static int send_record(const struct tracker_record *rec)
 	LOG_DBG("  timestamp=%s", timestamp);
 	LOG_DBG("  lat=%.7f  lon=%.7f  acc=%dm",
 		rec->latitude, rec->longitude, (int)rec->accuracy_m);
-	LOG_DBG("  temp=%d°C  pressure=%dPa  battery=%dmV",
-		rec->temperature_c, rec->pressure_pa, rec->battery_mv);
+	LOG_DBG("  temp=%d°C  pressure=%dPa  battery=%dmV  soc=%d%%",
+		rec->temperature_c, rec->pressure_pa, rec->battery_mv, rec->battery_soc);
 
 	snprintk(port_str, sizeof(port_str), "%d", CONFIG_APP_CLOUD_REST_SERVER_PORT);
 	err = zsock_getaddrinfo(CONFIG_APP_CLOUD_REST_SERVER_HOST, port_str, &hints, &res);
@@ -567,6 +576,8 @@ static enum smf_state_result handle_common_channels(struct cloud_state *s)
 						   ? sensor_cache.pressure_pa : 0,
 				.battery_mv      = sensor_cache.has_battery
 						   ? sensor_cache.battery_mv : 0,
+				.battery_soc     = sensor_cache.has_battery
+						   ? sensor_cache.battery_soc : -1,
 				.year            = gnss->datetime.year,
 				.month           = gnss->datetime.month,
 				.day             = gnss->datetime.day,
@@ -613,8 +624,10 @@ static enum smf_state_result handle_common_channels(struct cloud_state *s)
 
 		if (msg->type == POWER_BATTERY_PERCENTAGE_SAMPLE_RESPONSE) {
 			sensor_cache.battery_mv  = (int)(msg->voltage * 1000);
+			sensor_cache.battery_soc = (int)msg->percentage;
 			sensor_cache.has_battery = true;
-			LOG_DBG("Cached battery: %d mV", sensor_cache.battery_mv);
+			LOG_DBG("Cached battery: %d mV  %d%%",
+				sensor_cache.battery_mv, sensor_cache.battery_soc);
 		}
 		return SMF_EVENT_HANDLED;
 	}
@@ -623,11 +636,39 @@ static enum smf_state_result handle_common_channels(struct cloud_state *s)
 	return SMF_EVENT_PROPAGATE;
 }
 
+static void init_tracker_id(void)
+{
+	/* Called on first LTE connect — modem is ready for AT commands by then.
+	 * Derive tracker ID from modem IMEI: last 8 digits (SNR + check digit),
+	 * unique per physical device. */
+	char imei_buf[HW_ID_LEN];
+	int err = hw_id_get(imei_buf, sizeof(imei_buf));
+
+	if (err == 0) {
+		size_t imei_len = strlen(imei_buf);
+		const char *src = imei_len >= 8 ? &imei_buf[imei_len - 8] : imei_buf;
+
+		strncpy(tracker_id, src, sizeof(tracker_id) - 1);
+		tracker_id[sizeof(tracker_id) - 1] = '\0';
+	} else {
+		LOG_ERR("hw_id_get failed (%d) — using fallback ID", err);
+		strncpy(tracker_id, CONFIG_APP_CLOUD_REST_TRACKER_ID_FALLBACK,
+			sizeof(tracker_id) - 1);
+		tracker_id[sizeof(tracker_id) - 1] = '\0';
+	}
+
+	LOG_INF("Tracker ID: %s", tracker_id);
+}
+
 static void state_connected_entry(void *o)
 {
 	static bool initial_config_fetched;
 
 	ARG_UNUSED(o);
+
+	if (tracker_id[0] == '\0') {
+		init_tracker_id();
+	}
 
 	LOG_INF("Cloud connected (REST mode, server: %s)",
 		CONFIG_APP_CLOUD_REST_SERVER_HOST);
@@ -791,25 +832,6 @@ static void cloud_module_thread(void)
 	struct cloud_state cloud_state_obj = { 0 };
 
 	LOG_DBG("Cloud REST module started");
-
-	/* Obtain tracker ID */
-	if (IS_ENABLED(CONFIG_APP_CLOUD_REST_TRACKER_ID_OVERRIDE)) {
-		strncpy(tracker_id, CONFIG_APP_CLOUD_REST_TRACKER_ID_FALLBACK,
-			sizeof(tracker_id) - 1);
-		tracker_id[sizeof(tracker_id) - 1] = '\0';
-	} else {
-		err = hw_id_get(tracker_id, sizeof(tracker_id));
-		if (err) {
-			LOG_WRN("hw_id_get failed (%d), using fallback ID", err);
-			strncpy(tracker_id, CONFIG_APP_CLOUD_REST_TRACKER_ID_FALLBACK,
-				sizeof(tracker_id) - 1);
-			tracker_id[sizeof(tracker_id) - 1] = '\0';
-		} else {
-			tracker_id[sizeof(tracker_id) - 1] = '\0';
-		}
-	}
-
-	LOG_INF("Tracker ID: %s", tracker_id);
 
 	/* Publish FOTA_MODULE_READY so main.c can leave STATE_WAITING_FOR_MODULES_INIT.
 	 * FOTA is not supported in REST mode but the channel must signal ready.
