@@ -71,6 +71,11 @@ static bool ref_valid;
  */
 static bool is_active = true;
 static int  consec_count;
+/* Counts consecutive medium-band (INACT..ACT) samples. When this reaches
+ * RESETTLED_CONSEC_SAMPLES the device has settled at a new orientation and
+ * the reference is advanced so inactivity detection can converge. */
+static int  resettled_count;
+#define RESETTLED_CONSEC_SAMPLES MAX(1, (10000 / CONFIG_APP_MOTION_POLL_INTERVAL_MS))
 
 static void poll_work_fn(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(poll_work, poll_work_fn);
@@ -130,18 +135,34 @@ static void poll_work_fn(struct k_work *work)
 
 	if (is_active) {
 		/* Looking for inactivity.
-		 * Reference is only advanced on large movements so that
-		 * inactivity is measured against the settled position,
-		 * not against the previous 1-second sample (which would
-		 * always show near-zero delta due to sensor noise).
+		 * Three bands:
+		 *   delta > ACT_THRESHOLD_MG:   strong movement — advance reference, reset counter
+		 *   INACT_THRESHOLD_MG < delta: medium movement (e.g. car ride) — reset counter only
+		 *   delta <= INACT_THRESHOLD_MG: near-stillness — increment inactivity counter
 		 */
 		if (delta > ACT_THRESHOLD_MG) {
-			/* Significant movement — advance reference, reset counter */
+			/* Significant movement — advance reference, reset counters */
 			ref_x = x;
 			ref_y = y;
 			ref_z = z;
 			consec_count = 0;
+			resettled_count = 0;
+		} else if (delta > INACT_THRESHOLD_MG) {
+			/* Medium movement — device is not still, reset inactivity counter.
+			 * If we stay in this band for RESETTLED_CONSEC_SAMPLES polls the
+			 * device has settled at a new orientation; advance the reference so
+			 * the inactivity detection can converge rather than being stuck. */
+			consec_count = 0;
+			resettled_count++;
+			if (resettled_count >= RESETTLED_CONSEC_SAMPLES) {
+				resettled_count = 0;
+				ref_x = x;
+				ref_y = y;
+				ref_z = z;
+				LOG_DBG("re-settle: reference advanced");
+			}
 		} else {
+			resettled_count = 0;
 			consec_count++;
 			LOG_DBG("inact count %d/%d", consec_count, INACT_CONSEC_SAMPLES);
 			if (consec_count >= INACT_CONSEC_SAMPLES) {

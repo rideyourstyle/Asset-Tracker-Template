@@ -303,6 +303,12 @@ struct main_state {
 	 */
 	bool motion_inactivity_pending;
 
+	/* Set to true when a sleep-induced send is in progress (CLOUD_GOING_TO_SLEEP
+	 * published before the batch). connected_sending_run uses it to go to
+	 * STATE_SLEEPING instead of STATE_CONNECTED_WAITING after the batch completes.
+	 */
+	bool sleep_after_send;
+
 	/* Flags to track if each module is ready */
 	struct {
 		bool fota_ready;
@@ -1563,9 +1569,32 @@ static void connected_waiting_entry(void *o)
 
 #if defined(CONFIG_APP_MOTION)
 	if (state_object->motion_inactivity_pending && state_object->has_sent_status_once) {
-		LOG_INF("Deferred MOTION_INACTIVITY — entering sleep mode");
-		state_object->motion_inactivity_pending = false;
-		smf_set_state(SMF_CTX(state_object), &states[STATE_SLEEPING]);
+		if (state_object->send_pending) {
+			/* Status timer also deferred — send the regular active update first.
+			 * motion_inactivity_pending stays true so the NEXT waiting entry
+			 * immediately follows with noMotionSleep. */
+			LOG_INF("Deferred MOTION_INACTIVITY — sending regular status first");
+			state_object->send_pending = false;
+			smf_set_state(SMF_CTX(state_object), &states[STATE_CONNECTED_SENDING]);
+			return;
+		}
+
+		{
+			int err;
+			struct cloud_msg sleep_msg = { .type = CLOUD_GOING_TO_SLEEP };
+
+			LOG_INF("Deferred MOTION_INACTIVITY — sending noMotionSleep then sleeping");
+			state_object->motion_inactivity_pending = false;
+			state_object->sleep_after_send = true;
+
+			err = zbus_chan_pub(&cloud_chan, &sleep_msg, PUB_TIMEOUT);
+			if (err) {
+				LOG_ERR("Failed to publish CLOUD_GOING_TO_SLEEP, error: %d", err);
+				SEND_FATAL_ERROR();
+				return;
+			}
+		}
+		smf_set_state(SMF_CTX(state_object), &states[STATE_CONNECTED_SENDING]);
 		return;
 	}
 	state_object->motion_inactivity_pending = false;
@@ -1579,7 +1608,13 @@ static void connected_waiting_entry(void *o)
 	}
 
 	waiting_entry_common(state_object);
-	timer_status_start(state_object->update_interval_sec);
+
+	/* Only start the status timer if it is not already counting down.
+	 * With sample_interval < update_interval the timer must survive
+	 * WAITING→SAMPLING→WAITING cycles without being reset each time. */
+	if (!k_work_delayable_is_pending(&timer_status_update_work)) {
+		timer_status_start(state_object->update_interval_sec);
+	}
 }
 
 static enum smf_state_result connected_waiting_run(void *o)
@@ -1604,7 +1639,9 @@ static enum smf_state_result connected_waiting_run(void *o)
 		}
 
 		if (msg->type == TIMER_CONFIG_CHANGED) {
-			/* Re-enter state to restart both timers with new intervals */
+			/* Stop status timer so connected_waiting_entry restarts it
+			 * with the new interval (pending-check won't block the restart). */
+			timer_status_stop();
 			smf_set_state(SMF_CTX(state_object),
 				      &states[STATE_CONNECTED_WAITING]);
 
@@ -1632,8 +1669,20 @@ static enum smf_state_result connected_waiting_run(void *o)
 				LOG_DBG("MOTION_INACTIVITY ignored — no status sent yet");
 				return SMF_EVENT_HANDLED;
 			}
-			LOG_INF("Device stationary — entering sleep mode");
-			smf_set_state(SMF_CTX(state_object), &states[STATE_SLEEPING]);
+			LOG_INF("Device stationary — sending noMotionSleep then sleeping");
+			{
+				int err;
+				struct cloud_msg sleep_msg = { .type = CLOUD_GOING_TO_SLEEP };
+
+				state_object->sleep_after_send = true;
+				err = zbus_chan_pub(&cloud_chan, &sleep_msg, PUB_TIMEOUT);
+				if (err) {
+					LOG_ERR("Failed to publish CLOUD_GOING_TO_SLEEP: %d", err);
+					SEND_FATAL_ERROR();
+					return SMF_EVENT_HANDLED;
+				}
+			}
+			smf_set_state(SMF_CTX(state_object), &states[STATE_CONNECTED_SENDING]);
 
 			return SMF_EVENT_HANDLED;
 		}
@@ -1649,7 +1698,6 @@ static void connected_waiting_exit(void *o)
 
 	LOG_DBG("%s", __func__);
 	waiting_exit_common();
-	timer_status_stop();
 }
 
 static void connected_sending_entry(void *o)
@@ -1666,6 +1714,16 @@ static enum smf_state_result connected_sending_run(void *o)
 {
 	struct main_state *state_object = (struct main_state *)o;
 
+	if (state_object->chan == &timer_chan) {
+		const struct timer_msg *msg = (const struct timer_msg *)state_object->msg_buf;
+
+		/* Status timer fired while sending — defer to next WAITING entry */
+		if (msg->type == TIMER_EXPIRED_STATUS_UPDATE) {
+			state_object->send_pending = true;
+			return SMF_EVENT_HANDLED;
+		}
+	}
+
 	if (state_object->chan == &storage_chan) {
 		const struct storage_msg *msg = (const struct storage_msg *)state_object->msg_buf;
 
@@ -1674,11 +1732,17 @@ static enum smf_state_result connected_sending_run(void *o)
 			return SMF_EVENT_HANDLED;
 		}
 
-		/* Storage batch closed indicates sending is done, go back to waiting */
+		/* Storage batch closed indicates sending is done */
 		if (msg->type == STORAGE_BATCH_CLOSE) {
 			state_object->has_sent_status_once = true;
-			smf_set_state(SMF_CTX(state_object),
-				      &states[STATE_CONNECTED_WAITING]);
+			if (state_object->sleep_after_send) {
+				state_object->sleep_after_send = false;
+				smf_set_state(SMF_CTX(state_object),
+					      &states[STATE_SLEEPING]);
+			} else {
+				smf_set_state(SMF_CTX(state_object),
+					      &states[STATE_CONNECTED_WAITING]);
+			}
 
 			return SMF_EVENT_HANDLED;
 		}
@@ -1687,10 +1751,18 @@ static enum smf_state_result connected_sending_run(void *o)
 		if (msg->type == STORAGE_BATCH_EMPTY ||
 		    msg->type == STORAGE_BATCH_BUSY  ||
 		    msg->type == STORAGE_BATCH_ERROR) {
-			LOG_WRN("Batch not started (%d), returning to waiting", msg->type);
+			if (msg->type != STORAGE_BATCH_EMPTY) {
+				LOG_WRN("Batch not started (%d)", msg->type);
+			}
 			state_object->has_sent_status_once = true;
-			smf_set_state(SMF_CTX(state_object),
-				      &states[STATE_CONNECTED_WAITING]);
+			if (state_object->sleep_after_send) {
+				state_object->sleep_after_send = false;
+				smf_set_state(SMF_CTX(state_object),
+					      &states[STATE_SLEEPING]);
+			} else {
+				smf_set_state(SMF_CTX(state_object),
+					      &states[STATE_CONNECTED_WAITING]);
+			}
 
 			return SMF_EVENT_HANDLED;
 		}
@@ -1704,17 +1776,17 @@ static enum smf_state_result connected_sending_run(void *o)
 static void sleeping_entry(void *o)
 {
 	int err;
-	/* Ask cloud.c to send trackerStatus:"noMotionSleep" while still connected,
-	 * then cloud.c will publish NETWORK_DISCONNECT to take the modem offline. */
-	struct cloud_msg sleep_msg = { .type = CLOUD_GOING_TO_SLEEP };
+	/* noMotionSleep was already sent during the preceding batch; just disconnect. */
+	struct network_msg net_msg = { .type = NETWORK_DISCONNECT };
 
 	ARG_UNUSED(o);
 
+	timer_status_stop();
 	LOG_INF("Sleep mode — modem offline until motion detected");
 
-	err = zbus_chan_pub(&cloud_chan, &sleep_msg, PUB_TIMEOUT);
+	err = zbus_chan_pub(&network_chan, &net_msg, PUB_TIMEOUT);
 	if (err) {
-		LOG_ERR("Failed to publish CLOUD_GOING_TO_SLEEP, error: %d", err);
+		LOG_ERR("Failed to publish NETWORK_DISCONNECT, error: %d", err);
 		SEND_FATAL_ERROR();
 		return;
 	}

@@ -14,9 +14,9 @@
  *     → on HTTP 2xx: STORAGE_BATCH_ACK  (record deleted from flash)
  *     → on error:    STORAGE_BATCH_CLOSE (record kept, retry next interval)
  *
- * Sleep path (triggered by CLOUD_GOING_TO_SLEEP from main.c):
- *   → PUT /trackers/{id} with trackerStatus:"noMotionSleep"
- *   → NETWORK_DISCONNECT (modem offline)
+ * Sleep path (triggered by CLOUD_GOING_TO_SLEEP from main.c before the batch):
+ *   → sets going_to_sleep flag; next send_status(NULL) uses "noMotionSleep"
+ *   → NETWORK_DISCONNECT is issued by sleeping_entry in main.c after the batch
  */
 
 #include <zephyr/kernel.h>
@@ -117,6 +117,10 @@ static char tracker_id[TRACKER_ID_LEN];
 /* Watchdog channel ID — made file-scope so state handlers can feed it during batch loops */
 static int cloud_task_wdt_id = -1;
 
+/* Set to true by the CLOUD_GOING_TO_SLEEP handler before a sleep-induced batch send.
+ * Consumed by send_status(NULL) to select "noMotionSleep" instead of "active". */
+static bool going_to_sleep;
+
 /* -------------------------------------------------------------------------- */
 /* State machine declarations                                                  */
 /* -------------------------------------------------------------------------- */
@@ -138,6 +142,8 @@ struct cloud_state {
 	uint32_t batch_session_id;
 	bool batch_status_sent;   /* status PUT sent for current batch session */
 	bool batch_fetch_config;  /* server flagged fetchConfig:true in this batch */
+	bool batch_first_record;  /* true for the initial BATCH_AVAILABLE after REQUEST;
+				   * more_data is not reliable there — storage doesn't set it */
 };
 
 static enum smf_state_result handle_common_channels(struct cloud_state *s);
@@ -394,11 +400,16 @@ static int send_status(const char *tracker_status)
 
 	snprintk(url_buf, sizeof(url_buf), "%s/%s", CONFIG_APP_CLOUD_REST_API_PATH, tracker_id);
 
-	/* Determine tracker status: explicit > auto from fix availability */
+	/* Determine tracker status: explicit > sleep flag > auto from fix availability */
 	const char *status = tracker_status;
 
 	if (status == NULL) {
-		status = last_known_position_valid ? "active" : "activeWithoutFix";
+		if (going_to_sleep) {
+			status = "noMotionSleep";
+			going_to_sleep = false;
+		} else {
+			status = last_known_position_valid ? "active" : "activeWithoutFix";
+		}
 	}
 
 	/* Build JSON body */
@@ -878,6 +889,7 @@ static enum smf_state_result state_connected_run(void *o)
 				s->batch_status_sent = false;
 				s->batch_fetch_config = false;
 				s->batch_session_id = smsg->session_id;
+				s->batch_first_record = true;
 				positions_batch_len = 0;
 				positions_batch_count = 0;
 			}
@@ -893,6 +905,7 @@ static enum smf_state_result state_connected_run(void *o)
 					zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
 					s->batch_session_id = 0;
 					s->batch_status_sent = false;
+					s->batch_first_record = false;
 					return SMF_EVENT_HANDLED;
 				}
 				if (fc == 1) {
@@ -907,14 +920,23 @@ static enum smf_state_result state_connected_run(void *o)
 				zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
 				s->batch_session_id = 0;
 				s->batch_status_sent = false;
+				s->batch_first_record = false;
 				return SMF_EVENT_HANDLED;
 			}
 
 			/* Accumulate record into positions batch */
 			positions_batch_append(&item.data.TRACKER);
 
-			/* Last record in batch: POST all accumulated positions, then ACK */
-			if (!smsg->more_data) {
+			/* Flush when the storage module confirms this is the last record.
+			 * The initial BATCH_AVAILABLE (after REQUEST) always has more_data=false
+			 * regardless of record count — only trust it for post-ACK messages
+			 * (batch_first_record=false). Remaining records are flushed in the
+			 * STORAGE_BATCH_CLOSE handler below. */
+			bool is_last = !smsg->more_data && !s->batch_first_record;
+
+			s->batch_first_record = false;
+
+			if (is_last) {
 				positions_batch_flush();
 				if (s->batch_fetch_config) {
 					fetch_and_apply_config();
@@ -927,6 +949,25 @@ static enum smf_state_result state_connected_run(void *o)
 			reply.type = STORAGE_BATCH_ACK;
 			zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
 			return SMF_EVENT_HANDLED;
+		}
+
+		/* Storage sent BATCH_CLOSE after the last ACK (no more records).
+		 * Flush any positions accumulated but not yet POSTed (single-record
+		 * batch, or the is_last path wasn't reached due to more_data quirks). */
+		if (smsg->type == STORAGE_BATCH_CLOSE) {
+			if (positions_batch_count > 0) {
+				positions_batch_flush();
+			}
+			if (s->batch_fetch_config) {
+				fetch_and_apply_config();
+			}
+			s->batch_status_sent = false;
+			s->batch_fetch_config = false;
+			s->batch_first_record = false;
+			positions_batch_len = 0;
+			positions_batch_count = 0;
+			s->batch_session_id = 0;
+			return SMF_EVENT_PROPAGATE;  /* main.c handles the state transition */
 		}
 
 		if (smsg->type == STORAGE_BATCH_EMPTY || smsg->type == STORAGE_BATCH_ERROR) {
@@ -948,6 +989,7 @@ static enum smf_state_result state_connected_run(void *o)
 
 			s->batch_status_sent = false;
 			s->batch_fetch_config = false;
+			s->batch_first_record = false;
 			positions_batch_len = 0;
 			positions_batch_count = 0;
 			zbus_chan_pub(&storage_chan, &close, K_SECONDS(1));
@@ -963,12 +1005,11 @@ static enum smf_state_result state_connected_run(void *o)
 		const struct cloud_msg *msg = (const struct cloud_msg *)s->msg_buf;
 		struct cloud_msg resp = { 0 };
 
-		/* Device going to sleep: send noMotionSleep status, then disconnect */
+		/* Device going to sleep: flag the next send_status(NULL) to use
+		 * "noMotionSleep". The status is sent during the upcoming batch,
+		 * and the network disconnect is issued by sleeping_entry in main.c. */
 		if (msg->type == CLOUD_GOING_TO_SLEEP) {
-			send_status("noMotionSleep");
-			struct network_msg net_msg = { .type = NETWORK_DISCONNECT };
-
-			zbus_chan_pub(&network_chan, &net_msg, K_SECONDS(1));
+			going_to_sleep = true;
 			return SMF_EVENT_HANDLED;
 		}
 
@@ -1046,7 +1087,7 @@ static void cloud_module_thread(void)
 	while (true) {
 		err = task_wdt_feed(cloud_task_wdt_id);
 		if (err) {
-			LOG_ERR("task_wdt_feed, error: %d", err);
+			LOG_ERR("task_wdt_feed, errrrror: %d", err);
 			SEND_FATAL_ERROR();
 			return;
 		}
