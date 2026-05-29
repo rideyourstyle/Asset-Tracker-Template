@@ -10,6 +10,15 @@
 	status = "okay";
 };
 
+/* ADXL367 low-power accelerometer — used for wake-on-motion.
+ * ODR 12.5 Hz keeps the chip in its lowest-power measurement mode.
+ * Activity/inactivity thresholds are configured via Kconfig (ADXL367_*).
+ */
+&accelerometer_lp {
+	status = "okay";
+	odr = <0>; /* 12.5 Hz */
+};
+
 / {
 	chosen {
 		nordic,modem-trace-uart = &uart1;

@@ -5,12 +5,18 @@
  *   location_chan LOCATION_GNSS_DATA
  *     → combine GNSS + cached env/battery into compact tracker_record
  *     → publish tracker_record_chan  →  storage module persists to flash
+ *     → cache as last_known_position for the next status PUT
  *
  * Sending path (triggered by main.c every CONFIG_APP_CLOUD_UPDATE_INTERVAL_SECONDS):
- *   STORAGE_BATCH_AVAILABLE (one record at a time, peek-and-ack protocol)
- *     → HTTP PUT to dev.tracking.rideyourstyle.ch
+ *   STORAGE_BATCH_AVAILABLE / STORAGE_BATCH_EMPTY
+ *     → one PUT /trackers/{id}   (status: lastPosition + battery; once per batch)
+ *     → one POST /tracks/positions per stored record (peek-and-ack protocol)
  *     → on HTTP 2xx: STORAGE_BATCH_ACK  (record deleted from flash)
  *     → on error:    STORAGE_BATCH_CLOSE (record kept, retry next interval)
+ *
+ * Sleep path (triggered by CLOUD_GOING_TO_SLEEP from main.c):
+ *   → PUT /trackers/{id} with trackerStatus:"noMotionSleep"
+ *   → NETWORK_DISCONNECT (modem offline)
  */
 
 #include <zephyr/kernel.h>
@@ -100,6 +106,10 @@ static struct {
 	bool has_battery;
 } sensor_cache;
 
+/* Last GNSS fix — used as lastPosition in the status PUT */
+static struct tracker_record last_known_position;
+static bool last_known_position_valid;
+
 /* Tracker ID: last 8 digits of the modem IMEI (unique serial number portion) */
 #define TRACKER_ID_LEN 9  /* 8 chars + null */
 static char tracker_id[TRACKER_ID_LEN];
@@ -126,6 +136,8 @@ struct cloud_state {
 	const struct zbus_channel *chan;
 	uint8_t msg_buf[MAX_MSG_SIZE];
 	uint32_t batch_session_id;
+	bool batch_status_sent;   /* status PUT sent for current batch session */
+	bool batch_fetch_config;  /* server flagged fetchConfig:true in this batch */
 };
 
 static enum smf_state_result handle_common_channels(struct cloud_state *s);
@@ -163,7 +175,7 @@ static int http_response_cb(struct http_response *rsp,
 		*out_status = rsp->http_status_code;
 
 		if (rsp->http_status_code >= 200 && rsp->http_status_code < 300) {
-			LOG_INF("Position accepted (HTTP %d)", rsp->http_status_code);
+			LOG_INF("HTTP %d", rsp->http_status_code);
 		} else {
 			LOG_WRN("Server returned HTTP %d: %s",
 				rsp->http_status_code, rsp->http_status);
@@ -198,6 +210,67 @@ static int json_find_int(const char *json, const char *key, int32_t *out)
 	return 0;
 }
 
+/* Open a TCP (or TLS) connection to the configured REST server.
+ * Returns a connected socket fd ≥ 0, or -1 on error. Caller must zsock_close(). */
+static int cloud_connect(void)
+{
+	struct zsock_addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+	struct zsock_addrinfo *res;
+	char port_str[8];
+	int sock;
+	int err;
+
+	snprintk(port_str, sizeof(port_str), "%d", CONFIG_APP_CLOUD_REST_SERVER_PORT);
+	err = zsock_getaddrinfo(CONFIG_APP_CLOUD_REST_SERVER_HOST, port_str, &hints, &res);
+	if (err) {
+		LOG_ERR("DNS lookup for %s failed: %d", CONFIG_APP_CLOUD_REST_SERVER_HOST, err);
+		return -1;
+	}
+
+#if defined(CONFIG_APP_CLOUD_REST_TLS)
+	sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TLS_1_2);
+#else
+	sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TCP);
+#endif
+	if (sock < 0) {
+		LOG_ERR("socket() failed: %d", errno);
+		zsock_freeaddrinfo(res);
+		return -1;
+	}
+
+#if defined(CONFIG_APP_CLOUD_REST_TLS)
+	{
+		int peer_verify = TLS_PEER_VERIFY_NONE;
+
+		err = zsock_setsockopt(sock, SOL_TLS, TLS_HOSTNAME,
+				       CONFIG_APP_CLOUD_REST_SERVER_HOST,
+				       sizeof(CONFIG_APP_CLOUD_REST_SERVER_HOST) - 1);
+		if (!err) {
+			err = zsock_setsockopt(sock, SOL_TLS, TLS_PEER_VERIFY,
+					       &peer_verify, sizeof(peer_verify));
+		}
+		if (err) {
+			LOG_ERR("TLS setup failed: %d", errno);
+			zsock_close(sock);
+			zsock_freeaddrinfo(res);
+			return -1;
+		}
+	}
+#endif
+
+	err = zsock_connect(sock, res->ai_addr, res->ai_addrlen);
+	zsock_freeaddrinfo(res);
+	if (err) {
+		LOG_ERR("connect() to %s:%d failed: %d",
+			CONFIG_APP_CLOUD_REST_SERVER_HOST,
+			CONFIG_APP_CLOUD_REST_SERVER_PORT, errno);
+		zsock_close(sock);
+		return -1;
+	}
+
+	return sock;
+}
+
 /* Fetch new config from server and publish CLOUD_CONFIG_UPDATE.
  * Called when the status PUT response contains "fetchConfig":true.
  * Uses GET /trackers/{id}/config?ack=true so the server marks the config as fetched.
@@ -210,9 +283,6 @@ static void fetch_and_apply_config(void)
 	char api_key_hdr[sizeof("X-Api-Key: \r\n") + sizeof(CONFIG_APP_CLOUD_REST_API_KEY)];
 	const char *api_key_hdrs[2] = { NULL, NULL };
 	int http_status = 0;
-	struct zsock_addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
-	struct zsock_addrinfo *res;
-	char port_str[8];
 	int sock;
 	int err;
 
@@ -225,53 +295,9 @@ static void fetch_and_apply_config(void)
 	snprintk(url_buf, sizeof(url_buf), "%s/%s/config?ack=true",
 		 CONFIG_APP_CLOUD_REST_API_PATH, tracker_id);
 
-	snprintk(port_str, sizeof(port_str), "%d", CONFIG_APP_CLOUD_REST_SERVER_PORT);
-	err = zsock_getaddrinfo(CONFIG_APP_CLOUD_REST_SERVER_HOST, port_str, &hints, &res);
-	if (err) {
-		LOG_ERR("fetch_config: DNS lookup failed: %d", err);
-		return;
-	}
-
-#if defined(CONFIG_APP_CLOUD_REST_TLS)
-	sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TLS_1_2);
-#else
-	sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TCP);
-#endif
+	sock = cloud_connect();
 	if (sock < 0) {
-		LOG_ERR("fetch_config: socket() failed: %d", errno);
-		zsock_freeaddrinfo(res);
-		return;
-	}
-
-#if defined(CONFIG_APP_CLOUD_REST_TLS)
-	{
-		int peer_verify = TLS_PEER_VERIFY_NONE;
-
-		err = zsock_setsockopt(sock, SOL_TLS, TLS_HOSTNAME,
-				       CONFIG_APP_CLOUD_REST_SERVER_HOST,
-				       sizeof(CONFIG_APP_CLOUD_REST_SERVER_HOST) - 1);
-		if (err) {
-			LOG_ERR("fetch_config: TLS_HOSTNAME failed: %d", errno);
-			zsock_close(sock);
-			zsock_freeaddrinfo(res);
-			return;
-		}
-		err = zsock_setsockopt(sock, SOL_TLS, TLS_PEER_VERIFY,
-				       &peer_verify, sizeof(peer_verify));
-		if (err) {
-			LOG_ERR("fetch_config: TLS_PEER_VERIFY failed: %d", errno);
-			zsock_close(sock);
-			zsock_freeaddrinfo(res);
-			return;
-		}
-	}
-#endif
-
-	err = zsock_connect(sock, res->ai_addr, res->ai_addrlen);
-	zsock_freeaddrinfo(res);
-	if (err) {
-		LOG_ERR("fetch_config: connect() failed: %d", errno);
-		zsock_close(sock);
+		LOG_ERR("fetch_config: connect failed");
 		return;
 	}
 
@@ -341,12 +367,12 @@ static void fetch_and_apply_config(void)
 	}
 }
 
-/* Send one tracker_record via HTTPS PUT.
- * Returns  0: success, no config fetch needed
- * Returns  1: success, server signalled fetchConfig:true
- * Returns -1: error (socket, timeout, non-2xx)
+/* PUT /trackers/{id} — status update.
+ * tracker_status: NULL for active, "noMotionSleep" for sleep notification.
+ * Includes lastPosition (if a GNSS fix has been cached) and battery.
+ * Returns 0: success, 1: fetchConfig:true, -1: error.
  */
-static int send_record(const struct tracker_record *rec)
+static int send_status(const char *tracker_status)
 {
 	static char json_buf[CONFIG_APP_CLOUD_REST_JSON_BUFFER_SIZE];
 	static uint8_t recv_buf[256];
@@ -354,14 +380,9 @@ static int send_record(const struct tracker_record *rec)
 	char api_key_hdr[sizeof("X-Api-Key: \r\n") + sizeof(CONFIG_APP_CLOUD_REST_API_KEY)];
 	const char *api_key_hdrs[2] = { NULL, NULL };
 	char timestamp[32];
-	int json_len;
 	int http_status = 0;
-	struct zsock_addrinfo hints = {
-		.ai_family   = AF_INET,
-		.ai_socktype = SOCK_STREAM,
-	};
-	struct zsock_addrinfo *res;
-	char port_str[8];
+	int json_len;
+	bool comma = false;
 	int sock;
 	int err;
 
@@ -371,100 +392,67 @@ static int send_record(const struct tracker_record *rec)
 		api_key_hdrs[0] = api_key_hdr;
 	}
 
-	format_timestamp(timestamp, sizeof(timestamp), rec);
-
 	snprintk(url_buf, sizeof(url_buf), "%s/%s", CONFIG_APP_CLOUD_REST_API_PATH, tracker_id);
 
-	char soc_field[24] = "";
+	/* Build JSON body: all fields optional, comma-separated */
+	json_len = snprintk(json_buf, sizeof(json_buf), "{");
 
-	if (rec->battery_soc >= 0) {
-		snprintk(soc_field, sizeof(soc_field), ",\"batterySoc\":%d", rec->battery_soc);
+	if (tracker_status != NULL) {
+		json_len += snprintk(json_buf + json_len, sizeof(json_buf) - json_len,
+				     "\"trackerStatus\":\"%s\"", tracker_status);
+		comma = true;
 	}
 
-	json_len = snprintk(json_buf, sizeof(json_buf),
-		"{"
-		"\"sampleTimestamp\":\"%s\","
-		"\"latitude\":%.7f,"
-		"\"longitude\":%.7f,"
-		"\"pressure\":%d,"
-		"\"speed\":0,"
-		"\"temperature\":%d,"
-		"\"gnssAcc\":%d,"
-		"\"battery\":%d"
-		"%s"
-		"}",
-		timestamp,
-		rec->latitude,
-		rec->longitude,
-		rec->pressure_pa,
-		rec->temperature_c,
-		(int)rec->accuracy_m,
-		rec->battery_mv,
-		soc_field);
+	if (last_known_position_valid) {
+		format_timestamp(timestamp, sizeof(timestamp), &last_known_position);
+		json_len += snprintk(json_buf + json_len, sizeof(json_buf) - json_len,
+				     "%s\"lastPosition\":{"
+				     "\"sampleTimestamp\":\"%s\","
+				     "\"latitude\":%.7f,"
+				     "\"longitude\":%.7f,"
+				     "\"gnssAcc\":%d,"
+				     "\"pressure\":%d,"
+				     "\"speed\":0,"
+				     "\"temperature\":%d"
+				     "}",
+				     comma ? "," : "",
+				     timestamp,
+				     last_known_position.latitude,
+				     last_known_position.longitude,
+				     (int)last_known_position.accuracy_m,
+				     last_known_position.pressure_pa,
+				     last_known_position.temperature_c);
+		comma = true;
+	}
+
+	if (sensor_cache.has_battery) {
+		json_len += snprintk(json_buf + json_len, sizeof(json_buf) - json_len,
+				     "%s\"battery\":%d",
+				     comma ? "," : "",
+				     sensor_cache.battery_mv);
+		if (sensor_cache.battery_soc >= 0) {
+			json_len += snprintk(json_buf + json_len, sizeof(json_buf) - json_len,
+					     ",\"batterySoc\":%d", sensor_cache.battery_soc);
+		}
+		comma = true;
+	}
+
+	json_len += snprintk(json_buf + json_len, sizeof(json_buf) - json_len, "}");
 
 	if (json_len < 0 || json_len >= (int)sizeof(json_buf)) {
-		LOG_ERR("JSON buffer too small (%d bytes needed)", json_len);
+		LOG_ERR("send_status: JSON buffer overflow (%d bytes)", json_len);
 		return -1;
 	}
 
-	LOG_DBG("PUT %s (%d bytes)", url_buf, json_len);
-	LOG_DBG("  timestamp=%s", timestamp);
-	LOG_DBG("  lat=%.7f  lon=%.7f  acc=%dm",
-		rec->latitude, rec->longitude, (int)rec->accuracy_m);
-	LOG_DBG("  temp=%d°C  pressure=%dPa  battery=%dmV  soc=%d%%",
-		rec->temperature_c, rec->pressure_pa, rec->battery_mv, rec->battery_soc);
+	LOG_DBG("PUT %s (%s)", url_buf, tracker_status ? tracker_status : "active");
+	LOG_DBG("  body=%s", json_buf);
 
-	snprintk(port_str, sizeof(port_str), "%d", CONFIG_APP_CLOUD_REST_SERVER_PORT);
-	err = zsock_getaddrinfo(CONFIG_APP_CLOUD_REST_SERVER_HOST, port_str, &hints, &res);
-	if (err) {
-		LOG_ERR("DNS lookup for %s failed: %d", CONFIG_APP_CLOUD_REST_SERVER_HOST, err);
-		return -1;
-	}
-
-#if defined(CONFIG_APP_CLOUD_REST_TLS)
-	sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TLS_1_2);
-#else
-	sock = zsock_socket(res->ai_family, res->ai_socktype, IPPROTO_TCP);
-#endif
+	sock = cloud_connect();
 	if (sock < 0) {
-		LOG_ERR("socket() failed: %d", errno);
-		zsock_freeaddrinfo(res);
 		return -1;
 	}
 
-#if defined(CONFIG_APP_CLOUD_REST_TLS)
-	{
-		int peer_verify = TLS_PEER_VERIFY_NONE;
-
-		err = zsock_setsockopt(sock, SOL_TLS, TLS_HOSTNAME,
-				       CONFIG_APP_CLOUD_REST_SERVER_HOST,
-				       sizeof(CONFIG_APP_CLOUD_REST_SERVER_HOST) - 1);
-		if (err) {
-			LOG_ERR("TLS_HOSTNAME setsockopt failed: %d", errno);
-			zsock_close(sock);
-			zsock_freeaddrinfo(res);
-			return -1;
-		}
-		err = zsock_setsockopt(sock, SOL_TLS, TLS_PEER_VERIFY,
-				       &peer_verify, sizeof(peer_verify));
-		if (err) {
-			LOG_ERR("TLS_PEER_VERIFY setsockopt failed: %d", errno);
-			zsock_close(sock);
-			zsock_freeaddrinfo(res);
-			return -1;
-		}
-	}
-#endif
-
-	err = zsock_connect(sock, res->ai_addr, res->ai_addrlen);
-	zsock_freeaddrinfo(res);
-	if (err) {
-		LOG_ERR("connect() to %s:%d failed: %d",
-			CONFIG_APP_CLOUD_REST_SERVER_HOST,
-			CONFIG_APP_CLOUD_REST_SERVER_PORT, errno);
-		zsock_close(sock);
-		return -1;
-	}
+	memset(recv_buf, 0, sizeof(recv_buf));
 
 	struct http_request req = {
 		.method             = HTTP_PUT,
@@ -487,19 +475,106 @@ static int send_record(const struct tracker_record *rec)
 	zsock_close(sock);
 
 	if (err < 0) {
-		LOG_ERR("http_client_req failed: %d", err);
+		LOG_ERR("send_status: http_client_req failed: %d", err);
 		return -1;
 	}
 
 	if (http_status >= 200 && http_status < 300) {
-		LOG_DBG("Sent: lat=%.5f lon=%.5f acc=%dm",
-			rec->latitude, rec->longitude, (int)rec->accuracy_m);
-
-		/* Check if the server wants us to fetch a new config */
 		bool fetch_config = strstr((char *)recv_buf, "\"fetchConfig\":true") != NULL ||
 				    strstr((char *)recv_buf, "\"fetchConfig\": true") != NULL;
 
 		return fetch_config ? 1 : 0;
+	}
+
+	return -1;
+}
+
+/* POST /tracks/positions — send one stored position record.
+ * Returns 0: success, -1: error.
+ */
+static int send_position_post(const struct tracker_record *rec)
+{
+	static char json_buf[CONFIG_APP_CLOUD_REST_JSON_BUFFER_SIZE];
+	static uint8_t recv_buf[128];
+	char api_key_hdr[sizeof("X-Api-Key: \r\n") + sizeof(CONFIG_APP_CLOUD_REST_API_KEY)];
+	const char *api_key_hdrs[2] = { NULL, NULL };
+	char timestamp[32];
+	int http_status = 0;
+	int json_len;
+	int sock;
+	int err;
+
+	if (sizeof(CONFIG_APP_CLOUD_REST_API_KEY) > 1) {
+		snprintk(api_key_hdr, sizeof(api_key_hdr), "X-Api-Key: %s\r\n",
+			 CONFIG_APP_CLOUD_REST_API_KEY);
+		api_key_hdrs[0] = api_key_hdr;
+	}
+
+	format_timestamp(timestamp, sizeof(timestamp), rec);
+
+	json_len = snprintk(json_buf, sizeof(json_buf),
+		"{"
+		"\"trackerId\":\"%s\","
+		"\"positions\":[{"
+		"\"sampleTimestamp\":\"%s\","
+		"\"latitude\":%.7f,"
+		"\"longitude\":%.7f,"
+		"\"gnssAcc\":%d,"
+		"\"pressure\":%d,"
+		"\"speed\":0,"
+		"\"temperature\":%d"
+		"}]}",
+		tracker_id,
+		timestamp,
+		rec->latitude,
+		rec->longitude,
+		(int)rec->accuracy_m,
+		rec->pressure_pa,
+		rec->temperature_c);
+
+	if (json_len < 0 || json_len >= (int)sizeof(json_buf)) {
+		LOG_ERR("send_position_post: JSON buffer overflow (%d bytes)", json_len);
+		return -1;
+	}
+
+	LOG_DBG("POST %s — lat=%.5f lon=%.5f acc=%dm ts=%s",
+		CONFIG_APP_CLOUD_REST_POSITIONS_API_PATH,
+		rec->latitude, rec->longitude, (int)rec->accuracy_m, timestamp);
+
+	sock = cloud_connect();
+	if (sock < 0) {
+		return -1;
+	}
+
+	memset(recv_buf, 0, sizeof(recv_buf));
+
+	struct http_request req = {
+		.method             = HTTP_POST,
+		.url                = CONFIG_APP_CLOUD_REST_POSITIONS_API_PATH,
+		.protocol           = "HTTP/1.1",
+		.host               = CONFIG_APP_CLOUD_REST_SERVER_HOST,
+		.content_type_value = "application/json",
+		.payload            = json_buf,
+		.payload_len        = json_len,
+		.response           = http_response_cb,
+		.recv_buf           = recv_buf,
+		.recv_buf_len       = sizeof(recv_buf),
+		.optional_headers   = (sizeof(CONFIG_APP_CLOUD_REST_API_KEY) > 1)
+					? api_key_hdrs : NULL,
+	};
+
+	err = http_client_req(sock, &req,
+			      CONFIG_APP_CLOUD_REST_HTTP_TIMEOUT_SECONDS * MSEC_PER_SEC,
+			      &http_status);
+	zsock_close(sock);
+
+	if (err < 0) {
+		LOG_ERR("send_position_post: http_client_req failed: %d", err);
+		return -1;
+	}
+
+	if (http_status >= 200 && http_status < 300) {
+		return 0;
 	}
 
 	return -1;
@@ -548,12 +623,24 @@ static enum smf_state_result state_disconnected_run(void *o)
 		}
 	}
 
+	/* Going to sleep while disconnected: just take modem offline (no HTTP possible) */
+	if (s->chan == &cloud_chan) {
+		const struct cloud_msg *msg = (const struct cloud_msg *)s->msg_buf;
+
+		if (msg->type == CLOUD_GOING_TO_SLEEP) {
+			struct network_msg net_msg = { .type = NETWORK_DISCONNECT };
+
+			zbus_chan_pub(&network_chan, &net_msg, K_SECONDS(1));
+			return SMF_EVENT_HANDLED;
+		}
+	}
+
 	/* Record GNSS fixes and keep sensor cache fresh even when offline */
 	return handle_common_channels(s);
 }
 
 /* Handle channels that must be processed in BOTH connected and disconnected state:
- *   - location_chan: record GNSS fix to flash (offline buffering)
+ *   - location_chan: record GNSS fix to flash (offline buffering) + cache last position
  *   - environmental_chan: update sensor cache
  *   - power_chan: update battery cache
  * Returns SMF_EVENT_HANDLED if the message was consumed, SMF_EVENT_PROPAGATE otherwise.
@@ -587,6 +674,10 @@ static enum smf_state_result handle_common_channels(struct cloud_state *s)
 				.ms              = gnss->datetime.ms,
 				.timestamp_valid = gnss->datetime.valid ? 1u : 0u,
 			};
+
+			/* Cache for the next status PUT */
+			last_known_position = rec;
+			last_known_position_valid = true;
 
 			int pub_err = zbus_chan_pub(&tracker_record_chan, &rec, K_SECONDS(1));
 
@@ -663,8 +754,11 @@ static void init_tracker_id(void)
 static void state_connected_entry(void *o)
 {
 	static bool initial_config_fetched;
+	struct cloud_state *s = (struct cloud_state *)o;
 
-	ARG_UNUSED(o);
+	/* Reset batch-send state for the new connection */
+	s->batch_status_sent = false;
+	s->batch_fetch_config = false;
 
 	if (tracker_id[0] == '\0') {
 		init_tracker_id();
@@ -717,8 +811,11 @@ static enum smf_state_result state_connected_run(void *o)
 		}
 	}
 
-	/* Storage batch: peek-and-ack — one record per BATCH_AVAILABLE message.
-	 * Records stay in flash until ACKed (HTTP 2xx). On failure: CLOSE keeps the record.
+	/* Storage batch:
+	 *   1. First STORAGE_BATCH_AVAILABLE in a session: send PUT status (once per session).
+	 *   2. Every STORAGE_BATCH_AVAILABLE: read record, POST positions, ACK.
+	 *   3. STORAGE_BATCH_EMPTY / STORAGE_BATCH_ERROR: send PUT status if not yet sent,
+	 *      fetch config if signalled, close batch.
 	 */
 	if (s->chan == &storage_chan) {
 		const struct storage_msg *smsg = (const struct storage_msg *)s->msg_buf;
@@ -729,7 +826,30 @@ static enum smf_state_result state_connected_run(void *o)
 						     .data_type  = STORAGE_TYPE_TRACKER };
 			int read_err;
 
-			s->batch_session_id = smsg->session_id;
+			/* Detect new batch session → reset per-session flags */
+			if (smsg->session_id != s->batch_session_id) {
+				s->batch_status_sent = false;
+				s->batch_fetch_config = false;
+				s->batch_session_id = smsg->session_id;
+			}
+
+			/* Send status PUT once per batch session */
+			if (!s->batch_status_sent) {
+				int fc = send_status("active");
+
+				s->batch_status_sent = true;
+				if (fc < 0) {
+					LOG_WRN("Status PUT failed — closing batch for retry");
+					reply.type = STORAGE_BATCH_CLOSE;
+					zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
+					s->batch_session_id = 0;
+					s->batch_status_sent = false;
+					return SMF_EVENT_HANDLED;
+				}
+				if (fc == 1) {
+					s->batch_fetch_config = true;
+				}
+			}
 
 			read_err = storage_batch_read(&item, K_MSEC(500));
 			if (read_err != 0) {
@@ -737,24 +857,18 @@ static enum smf_state_result state_connected_run(void *o)
 				reply.type = STORAGE_BATCH_CLOSE;
 				zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
 				s->batch_session_id = 0;
+				s->batch_status_sent = false;
 				return SMF_EVENT_HANDLED;
 			}
 
-			int send_result = send_record(&item.data.TRACKER);
+			int post_result = send_position_post(&item.data.TRACKER);
 
-			if (send_result < 0) {
-				LOG_WRN("Send failed, keeping record for retry");
+			if (post_result < 0) {
+				LOG_WRN("Position POST failed — keeping record for retry");
 				reply.type = STORAGE_BATCH_CLOSE;
 				zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
 				s->batch_session_id = 0;
-				return SMF_EVENT_HANDLED;
-			}
-
-			if (send_result == 1) {
-				/* Server signalled fetchConfig:true — fetch after ACK */
-				reply.type = STORAGE_BATCH_ACK;
-				zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
-				fetch_and_apply_config();
+				s->batch_status_sent = false;
 				return SMF_EVENT_HANDLED;
 			}
 
@@ -769,6 +883,19 @@ static enum smf_state_result state_connected_run(void *o)
 				.session_id = smsg->session_id,
 			};
 
+			/* No records — still send status if not sent yet for this interval */
+			if (!s->batch_status_sent) {
+				int fc = send_status("active");
+
+				if (fc == 1) {
+					fetch_and_apply_config();
+				}
+			} else if (s->batch_fetch_config) {
+				fetch_and_apply_config();
+			}
+
+			s->batch_status_sent = false;
+			s->batch_fetch_config = false;
 			zbus_chan_pub(&storage_chan, &close, K_SECONDS(1));
 			s->batch_session_id = 0;
 			return SMF_EVENT_HANDLED;
@@ -777,12 +904,19 @@ static enum smf_state_result state_connected_run(void *o)
 		return SMF_EVENT_PROPAGATE;
 	}
 
-	/* Shadow/config requests: respond with empty responses so main.c can proceed
-	 * with its default configuration values.
-	 */
+	/* Shadow/config requests and sleep notification */
 	if (s->chan == &cloud_chan) {
 		const struct cloud_msg *msg = (const struct cloud_msg *)s->msg_buf;
 		struct cloud_msg resp = { 0 };
+
+		/* Device going to sleep: send noMotionSleep status, then disconnect */
+		if (msg->type == CLOUD_GOING_TO_SLEEP) {
+			send_status("noMotionSleep");
+			struct network_msg net_msg = { .type = NETWORK_DISCONNECT };
+
+			zbus_chan_pub(&network_chan, &net_msg, K_SECONDS(1));
+			return SMF_EVENT_HANDLED;
+		}
 
 		switch (msg->type) {
 		case CLOUD_SHADOW_GET_DESIRED:

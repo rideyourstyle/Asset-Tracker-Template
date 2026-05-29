@@ -1,0 +1,1141 @@
+openapi: 3.0.1
+info:
+  title: rideyourstyle Tracking API
+  description: This is a simple tracking API for GPS trackers.
+  contact:
+    email: peter@rideyourstyle.ch
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+  version: v1
+externalDocs:
+  description: Find out more about me
+  url: https://tracking.rideyourstyle.ch
+servers:
+- url: http://localhost:12346/v1/
+  description: local-mock
+- url: http://localhost:12345/v1/
+  description: local-server
+#- url: https://virtserver.swaggerhub.com/rideyourstyle/trackingAPI/v1
+#  description: SwaggerHub API Auto Mocking
+- url: https://tracking.rideyourstyle.ch/v1/
+  description: Live
+- url: https://dev.tracking.rideyourstyle.ch/v1/
+  description: Development
+security:
+- ApiKeyAuth: []
+tags:
+- name: Auth
+  description: User registration and login
+- name: Trackers
+  description: Everything about your Trackers
+- name: Tracks
+  description: Everything about Tracks
+- name: Positions
+  description: Everything about Positions
+- name: Routes
+  description: "Everything about Routes, a Route is defined by a track and multiple\
+    \ trackers (like a race ;-))"
+- name: Batteries
+  description: All about used batteries
+- name: Heatmap
+  description: Generate different heatmaps
+- name: Users
+  description: User management
+paths:
+  /users:
+    get:
+      tags:
+      - Users
+      summary: Get all users
+      operationId: getUsers
+      responses:
+        "200":
+          description: List of users
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UserInfo'
+        default:
+          description: Error
+      x-eov-operation-handler: Users
+  /auth/register:
+    post:
+      tags:
+      - Auth
+      summary: Register a new user
+      operationId: register
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthRequest'
+      responses:
+        "201":
+          description: User created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthRegisterResponse'
+        "409":
+          description: Username already taken
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Auth
+  /auth/login:
+    post:
+      tags:
+      - Auth
+      summary: Login and receive a JWT token
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthRequest'
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthLoginResponse'
+        "401":
+          description: Invalid credentials
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Auth
+  /trackers:
+    summary: Endpoint to handle trackers
+    get:
+      tags:
+      - Trackers
+      summary: Gets a list with the status of all trackers
+      description: ""
+      operationId: getTrackers
+      parameters:
+      - name: offset
+        in: query
+        required: false
+        style: form
+        explode: true
+        schema:
+          type: integer
+      - name: limit
+        in: query
+        required: false
+        style: form
+        explode: true
+        schema:
+          type: integer
+      - name: onTrackId
+        in: query
+        required: false
+        style: form
+        explode: true
+        schema:
+          $ref: '#/components/schemas/TrackId'
+      responses:
+        "200":
+          description: Successful request
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Trackers'
+                x-content-type: application/json
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Trackers
+  /trackers/{trackerId}:
+    get:
+      tags:
+      - Trackers
+      summary: Gets a tracker by trackerId.
+      description: Get a tacker with all his properties
+      operationId: getTrackerById
+      parameters:
+      - name: trackerId
+        in: path
+        description: ID of the tracker
+        required: true
+        style: simple
+        explode: false
+        schema:
+          $ref: '#/components/schemas/TrackerId'
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackerStatus'
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Trackers
+    put:
+      tags:
+      - Trackers
+      summary: Updates the status of a specific tracker
+      description: ""
+      operationId: updateTrackerStatusById
+      parameters:
+      - name: trackerId
+        in: path
+        description: ID of the tracker
+        required: true
+        style: simple
+        explode: false
+        schema:
+          $ref: '#/components/schemas/TrackerId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateStatus'
+        required: true
+      responses:
+        "200":
+          description: Successfully operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackerStatus'
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Trackers
+  /trackers/{trackerId}/owner:
+    put:
+      tags:
+      - Trackers
+      summary: Assigns an owner to a tracker
+      description: Links a userId to a tracker. Requires admin role.
+      operationId: setTrackerOwner
+      parameters:
+      - name: trackerId
+        in: path
+        required: true
+        style: simple
+        explode: false
+        schema:
+          $ref: '#/components/schemas/TrackerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetOwnerRequest'
+      responses:
+        "200":
+          description: Owner updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackerStatus'
+        default:
+          description: Error
+      x-eov-operation-handler: Trackers
+  /batteries/:
+    get:
+      tags:
+      - Batteries
+      summary: Get list of batteries.
+      description: Get a list of used batteries
+      operationId: getBatteries
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BatteryId'
+                x-content-type: application/json
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Batteries
+  /batteries/{batteryId}:
+    get:
+      tags:
+      - Batteries
+      summary: Get battery values.
+      description: Get a series of voltage values for the selected battery
+      operationId: getBatterySeries
+      parameters:
+      - name: batteryId
+        in: path
+        description: ID of the battery
+        required: true
+        style: simple
+        explode: false
+        schema:
+          $ref: '#/components/schemas/BatteryId'
+      - name: count
+        in: query
+        description: The number of voltage values to return.
+        required: false
+        style: form
+        explode: true
+        schema:
+          type: integer
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Battery'
+                x-content-type: application/json
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Batteries
+  /trackers/{trackerId}/config:
+    get:
+      tags:
+      - Trackers
+      summary: "Get a tracker config for a specific tacker, selected by trackerId."
+      description: "Get tracker configuration. Tracker hardware should add ?ack=true to acknowledge receipt and clear the fetchConfig flag."
+      operationId: getTrackerConfigById
+      parameters:
+      - name: trackerId
+        in: path
+        description: ID of the tracker
+        required: true
+        style: simple
+        explode: false
+        schema:
+          $ref: '#/components/schemas/TrackerId'
+      - name: ack
+        in: query
+        description: "Set to true by tracker hardware to acknowledge config receipt (clears fetchConfig flag)"
+        required: false
+        schema:
+          type: boolean
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackerConfig'
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Trackers
+    put:
+      tags:
+      - Trackers
+      summary: Update tracker config
+      description: Used by a tracker admin tool to configure the trackers
+      operationId: updateTrackerConfig
+      parameters:
+      - name: trackerId
+        in: path
+        description: ID of the tracker
+        required: true
+        style: simple
+        explode: false
+        schema:
+          $ref: '#/components/schemas/TrackerId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrackerConfig'
+        required: true
+      responses:
+        "200":
+          description: Config updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackerConfig'
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Trackers
+  /tracks:
+    summary: Endpoint to handle tracks
+    get:
+      tags:
+      - Tracks
+      summary: Gets all tracks
+      description: ""
+      operationId: getTracks
+      parameters:
+      - name: trackerId
+        in: query
+        required: false
+        style: form
+        explode: true
+        schema:
+          $ref: '#/components/schemas/TrackerId'
+      - name: offset
+        in: query
+        required: false
+        style: form
+        explode: true
+        schema:
+          type: integer
+      - name: limit
+        in: query
+        required: false
+        style: form
+        explode: true
+        schema:
+          type: integer
+      responses:
+        "200":
+          description: Successful request
+          content:
+            application/json:
+              schema:
+                type: array
+                example:
+                - trackName: Test Run 10k
+                  trackId: "12345678"
+                  trackerVersions: 0.0.0-dev
+                - trackName: Test Run 20k
+                  trackId: "87654321"
+                  trackerVersions: 0.0.1-dev
+                items:
+                  $ref: '#/components/schemas/GetTracksResponseItem'
+                x-content-type: application/json
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Tracks
+    post:
+      tags:
+      - Tracks
+      summary: Start a new track
+      description: ""
+      operationId: postTracks
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTrack'
+        required: true
+      responses:
+        "200":
+          description: Track created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateTrackResponse'
+        "404":
+          description: No tracker found with the given trackerId
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Tracks
+  /tracks/{trackId}/trackers:
+    post:
+      tags:
+      - Tracks
+      summary: Add a tracker to an existing track
+      operationId: addTrackerToTrack
+      parameters:
+      - name: trackId
+        in: path
+        required: true
+        style: simple
+        explode: false
+        schema:
+          $ref: '#/components/schemas/TrackId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddTrackerToTrack'
+        required: true
+      responses:
+        "200":
+          description: Tracker added successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetTrackResponse'
+        "404":
+          description: Track or tracker not found
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Tracks
+  /tracks/{trackId}:
+    get:
+      tags:
+      - Tracks
+      summary: Gets all details about a specified track.
+      description: Gets all details for a track without the waypoints
+      operationId: getTrackByTrackId
+      parameters:
+      - name: trackId
+        in: path
+        description: ID of the track
+        required: true
+        style: simple
+        explode: false
+        schema:
+          $ref: '#/components/schemas/TrackId'
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetTrackResponse'
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Tracks
+    patch:
+      tags:
+      - Tracks
+      summary: Update track properties
+      operationId: updateTrack
+      parameters:
+      - name: trackId
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/TrackId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTrack'
+      responses:
+        "200":
+          description: Updated track
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetTrackResponse'
+        default:
+          description: Error
+      x-eov-operation-handler: Tracks
+  /tracks/{trackId}/default:
+    put:
+      tags:
+      - Tracks
+      summary: Set track as default
+      operationId: setDefaultTrack
+      parameters:
+      - name: trackId
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/TrackId'
+      responses:
+        "200":
+          description: Default track set
+        default:
+          description: Error
+      x-eov-operation-handler: Tracks
+  /tracks/{trackId}/{trackerId}/positions:
+    get:
+      tags:
+      - Tracks
+      summary: Gets all positions of a participating tracker for a track.
+      description: Gets all positions of a specific tracker for the given track
+      operationId: getPositionsByTrackId
+      parameters:
+      - name: trackId
+        in: path
+        description: ID of the track
+        required: true
+        style: simple
+        explode: false
+        schema:
+          $ref: '#/components/schemas/TrackId'
+      - name: trackerId
+        in: path
+        description: ID of the tracker
+        required: true
+        style: simple
+        explode: false
+        schema:
+          $ref: '#/components/schemas/TrackerId'
+      - name: fromTimestamp
+        in: query
+        required: false
+        style: form
+        explode: true
+        schema:
+          type: string
+          format: date-time
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Position'
+                x-content-type: application/json
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Tracks
+  /tracks/positions:
+    summary: Endpoint to post position data for the own or foreign tracker
+    post:
+      tags:
+      - Positions
+      summary: Post position data
+      description: ""
+      operationId: postPositions
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/tracks_positions_body'
+        required: true
+      responses:
+        "200":
+          description: Track created successfully
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Positions
+  /tracks/positions/{positionId}:
+    summary: Endpoint to post position data for the own or foreign tracker
+    delete:
+      tags:
+      - Positions
+      summary: Delete position
+      description: ""
+      operationId: deletePosition
+      parameters:
+      - name: positionId
+        in: path
+        description: ID of the position
+        required: true
+        style: simple
+        explode: false
+        schema:
+          $ref: '#/components/schemas/PositionId'
+      responses:
+        "200":
+          description: Delete position successfully
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Positions
+  /routes:
+    summary: Gets all routes
+    get:
+      tags:
+      - Routes
+      summary: Gets all routes
+      description: Gets all routes
+      operationId: getRoutes
+      parameters:
+      - name: trackerId
+        in: query
+        required: false
+        style: form
+        explode: true
+        schema:
+          $ref: '#/components/schemas/TrackerId'
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Route'
+                x-content-type: application/json
+        default:
+          description: Response for all other status codes than 200
+      x-eov-operation-handler: Routes
+  /routes/{routeId}:
+    get:
+      tags:
+      - Routes
+      summary: Get a route with its path
+      operationId: getRouteById
+      parameters:
+      - name: routeId
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: Route with path
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteDetail'
+        default:
+          description: Error
+      x-eov-operation-handler: Routes
+    delete:
+      tags:
+      - Routes
+      summary: Delete a route
+      operationId: deleteRoute
+      parameters:
+      - name: routeId
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: Deleted
+        default:
+          description: Error
+      x-eov-operation-handler: Routes
+  /routes/{routeId}/path-high:
+    get:
+      tags:
+      - Routes
+      summary: Get high-detail path for a route (lazy-loaded)
+      operationId: getRouteHighPath
+      parameters:
+      - name: routeId
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: High-detail path
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteHighPath'
+        default:
+          description: Error
+      x-eov-operation-handler: Routes
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    TrackerVersions:
+      maxLength: 128
+      type: string
+      description: Firmware versions of all used modules
+    Route:
+      type: object
+      properties:
+        routeId:
+          type: string
+        routeName:
+          maxLength: 128
+          type: string
+        length:
+          type: number
+          description: Total distance in km
+        elevationGain:
+          type: integer
+          description: Total elevation gain in m
+        elevationLoss:
+          type: integer
+          description: Total elevation loss in m
+    LatLng:
+      type: object
+      properties:
+        lat:
+          type: number
+        lng:
+          type: number
+    RouteDetail:
+      allOf:
+      - $ref: '#/components/schemas/Route'
+      - type: object
+        properties:
+          pathLow:
+            type: array
+            items:
+              $ref: '#/components/schemas/LatLng'
+          pathMid:
+            type: array
+            items:
+              $ref: '#/components/schemas/LatLng'
+    RouteHighPath:
+      type: object
+      properties:
+        pathHigh:
+          type: array
+          items:
+            $ref: '#/components/schemas/LatLng'
+    Battery:
+      type: integer
+      description: Battery voltage in mV
+      format: int32
+    BatteryId:
+      type: string
+      description: Unique ID for every battery
+      example: "95D1C369"
+    TrackerId:
+      type: string
+      description: Unique ID for every tracker
+    TrackId:
+      type: string
+      description: Unique ID for every recorded track
+    PositionId:
+      type: string
+      description: Unique ID for every position
+    CreateTrack:
+      type: object
+      properties:
+        trackerId:
+          $ref: '#/components/schemas/TrackerId'
+        trackerVersions:
+          $ref: '#/components/schemas/TrackerVersions'
+        trackName:
+          type: string
+        routeId:
+          type: string
+          description: Optional route to associate with this track
+    CreateTrackResponse:
+      type: object
+      properties:
+        trackId:
+          $ref: '#/components/schemas/TrackId'
+      example:
+        trackId: trackId
+    TrackerStatus:
+      type: object
+      properties:
+        trackerId:
+          $ref: '#/components/schemas/TrackerId'
+        trackId:
+          $ref: '#/components/schemas/TrackId'
+        battery:
+          $ref: '#/components/schemas/Battery'
+        statusTimestamp:
+          type: string
+          description: Timestamp when the last status was recorded
+          format: date-time
+        lastPosition:
+          $ref: '#/components/schemas/Position'
+        batterySoc:
+          type: integer
+          description: State of charge in percent (0-100)
+          minimum: 0
+          maximum: 100
+        fetchConfig:
+          type: boolean
+          description: "If true, tracker should fetch updated config via GET /trackers/{trackerId}/config?ack=true"
+        ownerName:
+          type: string
+          description: Username of the assigned owner
+        ownerId:
+          type: string
+          description: userId of the assigned owner
+        routeProgress:
+          type: integer
+          description: Progress along the assigned route in percent (0-100)
+          minimum: 0
+          maximum: 100
+        trackerStatus:
+          type: string
+          description: "Current tracker mode (e.g. noMotionSleep)"
+        offRouteDistance:
+          type: integer
+          description: Distance from the nearest route point in meters
+        snappedPosition:
+          type: object
+          description: Coordinates of the projected position on the route
+          properties:
+            lat:
+              type: number
+            lng:
+              type: number
+      example:
+        trackerId: trackerId
+        trackId: trackId
+        statusTimestamp: 2000-01-23T04:56:07.000+00:00
+        lastPosition:
+          sampleTimestamp: 2000-01-23T04:56:07.000+00:00
+          positionId: positionId
+          latitude: 6.02745618307040320615897144307382404804229736328125
+          longitude: 1.46581298050294517310021547018550336360931396484375
+          pressure: 97000
+          speed: 0
+          temperature: 20
+          gnssAcc: 7
+        battery: 3800
+    Trackers:
+      type: object
+      properties:
+        trackerId:
+          $ref: '#/components/schemas/TrackerId'
+        trackId:
+          $ref: '#/components/schemas/TrackId'
+        latitude:
+          type: number
+          format: double
+        longitude:
+          type: number
+          format: double
+        lastSampleTimestamp:
+          type: string
+          format: date-time
+      example:
+        trackerId: trackerId
+        trackId: trackId
+        latitude: 0.80082819046101150206595775671303272247314453125
+        lastSampleTimestamp: 2000-01-23T04:56:07.000+00:00
+        longitude: 6.02745618307040320615897144307382404804229736328125
+    Position:
+      type: object
+      properties:
+        positionId:
+          type: string
+        sampleTimestamp:
+          type: string
+          description: Timestamp when this dataset was recorded
+          format: date-time
+        latitude:
+          type: number
+          format: double
+        longitude:
+          type: number
+          format: double
+        pressure:
+          type: integer
+          format: int32
+        speed:
+          type: integer
+          format: int32
+        temperature:
+          type: integer
+          description: Temperature in degree
+          format: int32
+        gnssAcc:
+          type: integer
+          description: Quality of the position (unit TBD)
+      example:
+        sampleTimestamp: 2000-01-23T04:56:07.000+00:00
+        positionId: positionId
+        latitude: 6.02745618307040320615897144307382404804229736328125
+        temperature: 2
+        gnssAcc: 7
+        pressure: 5
+        speed: 5
+        longitude: 1.46581298050294517310021547018550336360931396484375
+    PostPosition:
+      type: object
+      properties:
+        sampleTimestamp:
+          type: string
+          description: Timestamp when this dataset was recorded
+          format: date-time
+        latitude:
+          type: number
+          format: double
+        longitude:
+          type: number
+          format: double
+        pressure:
+          type: integer
+          format: int32
+        speed:
+          type: integer
+          format: int32
+        temperature:
+          type: integer
+          description: Temperature in degree
+          format: int32
+        gnssAcc:
+          type: integer
+          description: Quality of the position (unit TBD)
+    UpdateStatus:
+      type: object
+      properties:
+        trackerStatus:
+          type: string
+          description: "Current tracker mode (e.g. noMotionSleep)"
+        lastPosition:
+          type: object
+          properties:
+            sampleTimestamp:
+              type: string
+              format: date-time
+            latitude:
+              type: number
+              format: double
+            longitude:
+              type: number
+              format: double
+            gnssAcc:
+              type: integer
+              format: int32
+            pressure:
+              type: integer
+              format: int32
+            speed:
+              type: integer
+              format: int32
+            temperature:
+              type: integer
+              description: Temperature in degree
+              format: int32
+        battery:
+          $ref: '#/components/schemas/Battery'
+        batterySoc:
+          type: integer
+          description: State of charge in percent (0-100)
+          minimum: 0
+          maximum: 100
+    UserInfo:
+      type: object
+      properties:
+        userId:
+          type: string
+        username:
+          type: string
+        role:
+          type: string
+    UpdateTrack:
+      type: object
+      properties:
+        routeId:
+          type: string
+          nullable: true
+          description: Route to link (null to unlink)
+        trackName:
+          type: string
+    SetOwnerRequest:
+      type: object
+      required:
+      - userId
+      properties:
+        userId:
+          type: string
+          description: ID of the user to assign as owner
+    AddTrackerToTrack:
+      type: object
+      required:
+      - trackerId
+      properties:
+        trackerId:
+          $ref: '#/components/schemas/TrackerId'
+        trackerVersions:
+          $ref: '#/components/schemas/TrackerVersions'
+    TrackParticipant:
+      type: object
+      properties:
+        trackerId:
+          $ref: '#/components/schemas/TrackerId'
+        trackerVersions:
+          $ref: '#/components/schemas/TrackerVersions'
+      example:
+        trackerId: trackerId
+        trackerVersions: trackerVersions
+    GetTrackResponse:
+      type: object
+      properties:
+        trackId:
+          $ref: '#/components/schemas/TrackId'
+        trackName:
+          type: string
+        trackers:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrackParticipant'
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+      example:
+        trackId: trackId
+        trackName: trackName
+        startTime: 2000-01-23T04:56:07.000+00:00
+        endTime: 2000-01-23T04:56:07.000+00:00
+        trackers:
+        - trackerId: trackerId
+          trackerVersions: trackerVersions
+    GetTracksResponseItem:
+      type: object
+      properties:
+        trackName:
+          type: string
+        trackId:
+          $ref: '#/components/schemas/TrackId'
+        trackerVersions:
+          $ref: '#/components/schemas/TrackerVersions'
+        startTime:
+          type: string
+          format: date-time
+        endTimestamp:
+          type: string
+          format: date-time
+    TrackerConfig:
+      type: object
+      properties:
+        sampleInterval:
+          type: integer
+          description: Sample interval in seconds
+          format: int32
+        transmitInterval:
+          type: integer
+          description: Transmit interval in seconds
+          format: int32
+        pending:
+          type: boolean
+          description: "True if config was updated but not yet fetched by tracker with ?ack=true"
+      description: |-
+        Represents the complete tracker configuration:
+          * sample interval
+          * tracking interval
+      example:
+        sampleInterval: 30
+        transmitInterval: 60
+    tracks_positions_body:
+      type: object
+      properties:
+        trackerId:
+          $ref: '#/components/schemas/TrackerId'
+        positions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PostPosition'
+    AuthRequest:
+      type: object
+      required:
+      - username
+      - password
+      properties:
+        username:
+          type: string
+          maxLength: 64
+        password:
+          type: string
+    AuthRegisterResponse:
+      type: object
+      properties:
+        userId:
+          type: string
+        username:
+          type: string
+        role:
+          type: string
+          enum: [user, admin]
+    AuthLoginResponse:
+      type: object
+      properties:
+        token:
+          type: string
+        username:
+          type: string
+        role:
+          type: string
+          enum: [user, admin]

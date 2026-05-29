@@ -48,6 +48,12 @@ config APP_CLOUD_REST_API_PATH
 	  URL path prefix for the tracker endpoint. The tracker ID is appended
 	  automatically: PUT {prefix}/{tracker_id}
 
+config APP_CLOUD_REST_POSITIONS_API_PATH
+	string "REST API positions path"
+	default "/v1/tracks/positions"
+	help
+	  URL path for posting position data: POST {path}
+
 config APP_CLOUD_REST_TRACKER_ID_FALLBACK
 	string "Fallback tracker ID"
 	default "UNKNOWN"

@@ -40,6 +40,10 @@
 #include "power.h"
 #endif /* CONFIG_APP_POWER */
 
+#if defined(CONFIG_APP_MOTION)
+#include "motion.h"
+#endif /* CONFIG_APP_MOTION */
+
 /* Register log module */
 LOG_MODULE_REGISTER(main, 4);
 
@@ -135,7 +139,8 @@ ZBUS_CHAN_DEFINE(priv_main_chan,
 	X(storage_chan,		struct storage_msg)		\
 	X(timer_chan,		struct timer_msg)		\
 	X(priv_main_chan,	struct priv_main_msg)		\
-	IF_ENABLED(CONFIG_APP_POWER, (X(power_chan, struct power_msg)))
+	IF_ENABLED(CONFIG_APP_POWER, (X(power_chan, struct power_msg)))	\
+	IF_ENABLED(CONFIG_APP_MOTION, (X(motion_chan, struct motion_msg)))
 
 /* Calculate the maximum message size from the list of channels */
 #define MAX_MSG_SIZE			MAX_MSG_SIZE_FROM_LIST(CHANNEL_LIST)
@@ -202,6 +207,10 @@ static enum smf_state_result fota_applying_image_run(void *o);
 
 static void fota_rebooting_entry(void *o);
 
+/* Sleeping state handlers */
+static void sleeping_entry(void *o);
+static enum smf_state_result sleeping_run(void *o);
+
 enum app_state {
 	/* Waiting for module initialization */
 	STATE_WAITING_FOR_MODULES_INIT,
@@ -221,6 +230,9 @@ enum app_state {
 			STATE_CONNECTED_WAITING,
 			/* Sending buffered data to the cloud */
 			STATE_CONNECTED_SENDING,
+
+	/* Device is stationary — modem offline, waiting for motion to resume */
+	STATE_SLEEPING,
 
 	/* Firmware Over-The-Air update is in progress */
 	STATE_FOTA,
@@ -291,6 +303,20 @@ struct main_state {
 	 * Initial SHADOW_GET_DESIRED and FOTA_POLL_REQUEST
 	 */
 	bool cloud_synced_on_connect;
+
+	/* Set to true after the first complete send cycle (STORAGE_BATCH_CLOSE received in
+	 * STATE_CONNECTED_SENDING). Sleep via MOTION_INACTIVITY is only allowed once this
+	 * has happened — prevents the tracker from going to sleep before the server knows
+	 * its position.
+	 */
+	bool has_sent_status_once;
+
+	/* Set to true when MOTION_INACTIVITY arrives while the device is in a sampling
+	 * state (GNSS search in progress). The ADXL367 LINKED-mode cycles back to
+	 * activity detection after INACT fires, so the event would be lost by the time
+	 * the device enters a WAITING state. This flag carries the intent across.
+	 */
+	bool motion_inactivity_pending;
 
 	/* Flags to track if each module is ready */
 	struct {
@@ -372,6 +398,13 @@ static const struct smf_state states[] = {
 		&states[STATE_CONNECTED],
 		NULL
 	),
+	[STATE_SLEEPING] = SMF_CREATE_STATE(
+		sleeping_entry,
+		sleeping_run,
+		NULL,
+		&states[STATE_RUNNING],
+		NULL
+	),
 	/* FOTA states */
 	[STATE_FOTA] = SMF_CREATE_STATE(
 		fota_entry,
@@ -441,6 +474,8 @@ static const char *main_state_to_string(enum app_state state)
 		return "STATE_CONNECTED_WAITING";
 	case STATE_CONNECTED_SENDING:
 		return "STATE_CONNECTED_SENDING";
+	case STATE_SLEEPING:
+		return "STATE_SLEEPING";
 	case STATE_FOTA:
 		return "STATE_FOTA";
 	case STATE_FOTA_DOWNLOADING:
@@ -1300,6 +1335,23 @@ static enum smf_state_result disconnected_sampling_run(void *o)
 		}
 	}
 
+#if defined(CONFIG_APP_MOTION)
+	/* INACT can fire during the long GNSS search — remember it so the WAITING entry
+	 * can still trigger sleep instead of losing the event. */
+	if (state_object->chan == &motion_chan) {
+		const struct motion_msg *msg = (const struct motion_msg *)state_object->msg_buf;
+
+		if (msg->type == MOTION_INACTIVITY) {
+			state_object->motion_inactivity_pending = true;
+			return SMF_EVENT_HANDLED;
+		}
+		if (msg->type == MOTION_ACTIVITY) {
+			state_object->motion_inactivity_pending = false;
+			return SMF_EVENT_HANDLED;
+		}
+	}
+#endif /* CONFIG_APP_MOTION */
+
 	/* Ignore other triggers while sampling */
 	if (state_object->chan == &button_chan) {
 		const struct button_msg *msg = (const struct button_msg *)state_object->msg_buf;
@@ -1316,9 +1368,20 @@ static enum smf_state_result disconnected_sampling_run(void *o)
 
 static void disconnected_waiting_entry(void *o)
 {
-	const struct main_state *state_object = (const struct main_state *)o;
+	struct main_state *state_object = (struct main_state *)o;
 
 	LOG_DBG("%s", __func__);
+
+#if defined(CONFIG_APP_MOTION)
+	if (state_object->motion_inactivity_pending && state_object->has_sent_status_once) {
+		LOG_INF("Deferred MOTION_INACTIVITY — entering sleep mode");
+		state_object->motion_inactivity_pending = false;
+		smf_set_state(SMF_CTX(state_object), &states[STATE_SLEEPING]);
+		return;
+	}
+	state_object->motion_inactivity_pending = false;
+#endif /* CONFIG_APP_MOTION */
+
 	waiting_entry_common(state_object);
 
 #if defined(CONFIG_APP_LED)
@@ -1377,6 +1440,23 @@ static enum smf_state_result disconnected_waiting_run(void *o)
 			return SMF_EVENT_HANDLED;
 		}
 	}
+
+#if defined(CONFIG_APP_MOTION)
+	if (state_object->chan == &motion_chan) {
+		const struct motion_msg *msg = (const struct motion_msg *)state_object->msg_buf;
+
+		if (msg->type == MOTION_INACTIVITY) {
+			if (!state_object->has_sent_status_once) {
+				LOG_DBG("MOTION_INACTIVITY ignored — no status sent yet");
+				return SMF_EVENT_HANDLED;
+			}
+			LOG_INF("Device stationary — entering sleep mode");
+			smf_set_state(SMF_CTX(state_object), &states[STATE_SLEEPING]);
+
+			return SMF_EVENT_HANDLED;
+		}
+	}
+#endif /* CONFIG_APP_MOTION */
 
 	return SMF_EVENT_PROPAGATE;
 }
@@ -1448,6 +1528,22 @@ static enum smf_state_result connected_sampling_run(void *o)
 		}
 	}
 
+#if defined(CONFIG_APP_MOTION)
+	/* INACT can fire during the long GNSS search — remember it. */
+	if (state_object->chan == &motion_chan) {
+		const struct motion_msg *msg = (const struct motion_msg *)state_object->msg_buf;
+
+		if (msg->type == MOTION_INACTIVITY) {
+			state_object->motion_inactivity_pending = true;
+			return SMF_EVENT_HANDLED;
+		}
+		if (msg->type == MOTION_ACTIVITY) {
+			state_object->motion_inactivity_pending = false;
+			return SMF_EVENT_HANDLED;
+		}
+	}
+#endif /* CONFIG_APP_MOTION */
+
 	return SMF_EVENT_PROPAGATE;
 }
 
@@ -1455,9 +1551,20 @@ static enum smf_state_result connected_sampling_run(void *o)
 
 static void connected_waiting_entry(void *o)
 {
-	const struct main_state *state_object = (const struct main_state *)o;
+	struct main_state *state_object = (struct main_state *)o;
 
 	LOG_DBG("%s", __func__);
+
+#if defined(CONFIG_APP_MOTION)
+	if (state_object->motion_inactivity_pending && state_object->has_sent_status_once) {
+		LOG_INF("Deferred MOTION_INACTIVITY — entering sleep mode");
+		state_object->motion_inactivity_pending = false;
+		smf_set_state(SMF_CTX(state_object), &states[STATE_SLEEPING]);
+		return;
+	}
+	state_object->motion_inactivity_pending = false;
+#endif /* CONFIG_APP_MOTION */
+
 	waiting_entry_common(state_object);
 }
 
@@ -1495,6 +1602,23 @@ static enum smf_state_result connected_waiting_run(void *o)
 		}
 	}
 
+#if defined(CONFIG_APP_MOTION)
+	if (state_object->chan == &motion_chan) {
+		const struct motion_msg *msg = (const struct motion_msg *)state_object->msg_buf;
+
+		if (msg->type == MOTION_INACTIVITY) {
+			if (!state_object->has_sent_status_once) {
+				LOG_DBG("MOTION_INACTIVITY ignored — no status sent yet");
+				return SMF_EVENT_HANDLED;
+			}
+			LOG_INF("Device stationary — entering sleep mode");
+			smf_set_state(SMF_CTX(state_object), &states[STATE_SLEEPING]);
+
+			return SMF_EVENT_HANDLED;
+		}
+	}
+#endif /* CONFIG_APP_MOTION */
+
 	return SMF_EVENT_PROPAGATE;
 }
 
@@ -1530,6 +1654,7 @@ static enum smf_state_result connected_sending_run(void *o)
 
 		/* Storage batch closed indicates sending is done, go back to waiting */
 		if (msg->type == STORAGE_BATCH_CLOSE) {
+			state_object->has_sent_status_once = true;
 			smf_set_state(SMF_CTX(state_object),
 				      &states[STATE_CONNECTED_WAITING]);
 
@@ -1547,6 +1672,90 @@ static enum smf_state_result connected_sending_run(void *o)
 			return SMF_EVENT_HANDLED;
 		}
 	}
+
+	return SMF_EVENT_PROPAGATE;
+}
+
+/* STATE_SLEEPING */
+
+static void sleeping_entry(void *o)
+{
+	int err;
+	/* Ask cloud.c to send trackerStatus:"noMotionSleep" while still connected,
+	 * then cloud.c will publish NETWORK_DISCONNECT to take the modem offline. */
+	struct cloud_msg sleep_msg = { .type = CLOUD_GOING_TO_SLEEP };
+
+	ARG_UNUSED(o);
+
+	LOG_INF("Sleep mode — modem offline until motion detected");
+
+	err = zbus_chan_pub(&cloud_chan, &sleep_msg, PUB_TIMEOUT);
+	if (err) {
+		LOG_ERR("Failed to publish CLOUD_GOING_TO_SLEEP, error: %d", err);
+		SEND_FATAL_ERROR();
+		return;
+	}
+
+#if defined(CONFIG_APP_LED)
+	struct led_msg led_msg = {
+		.type = LED_RGB_SET,
+		.red = 0,
+		.green = 0,
+		.blue = 0,
+		.duration_on_msec = 1,
+		.duration_off_msec = 0,
+		.repetitions = 1,
+	};
+
+	err = zbus_chan_pub(&led_chan, &led_msg, PUB_TIMEOUT);
+	if (err) {
+		LOG_ERR("Failed to publish LED off message, error: %d", err);
+		SEND_FATAL_ERROR();
+		return;
+	}
+#endif /* CONFIG_APP_LED */
+}
+
+static enum smf_state_result sleeping_run(void *o)
+{
+#if defined(CONFIG_APP_MOTION)
+	struct main_state *state_object = (struct main_state *)o;
+
+	if (state_object->chan == &motion_chan) {
+		const struct motion_msg *msg = (const struct motion_msg *)state_object->msg_buf;
+
+		if (msg->type == MOTION_ACTIVITY) {
+			int err;
+			struct network_msg net_msg = { .type = NETWORK_CONNECT };
+
+			LOG_INF("Motion detected — waking up");
+
+			err = zbus_chan_pub(&network_chan, &net_msg, PUB_TIMEOUT);
+			if (err) {
+				LOG_ERR("Failed to publish NETWORK_CONNECT, error: %d", err);
+				SEND_FATAL_ERROR();
+				return SMF_EVENT_HANDLED;
+			}
+
+			state_object->first_send_pending = true;
+			smf_set_state(SMF_CTX(state_object),
+				      &states[STATE_DISCONNECTED_SAMPLING]);
+
+			return SMF_EVENT_HANDLED;
+		}
+	}
+
+	/* Swallow cloud/network events that arrive as a side-effect of disconnecting */
+	if (state_object->chan == &cloud_chan) {
+		return SMF_EVENT_HANDLED;
+	}
+
+	if (state_object->chan == &network_chan) {
+		return SMF_EVENT_HANDLED;
+	}
+#else
+	ARG_UNUSED(o);
+#endif /* CONFIG_APP_MOTION */
 
 	return SMF_EVENT_PROPAGATE;
 }

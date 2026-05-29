@@ -17,6 +17,7 @@ rsource "src/modules/environmental/Kconfig.environmental"
 rsource "src/modules/button/Kconfig.button"
 rsource "src/modules/storage/Kconfig.storage"
 rsource "src/modules/sgp4/Kconfig.sgp4"
+rsource "src/modules/motion/Kconfig.motion"
 rsource "src/inspect/Kconfig.inspect"
 rsource "memfault/Kconfig.memfault"
 endmenu
