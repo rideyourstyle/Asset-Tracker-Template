@@ -88,7 +88,17 @@ config APP_CLOUD_REST_JSON_BUFFER_SIZE
 	int "JSON payload buffer size in bytes"
 	default 512
 	help
-	  Size of the static buffer used to hold the JSON request body.
+	  Size of the static buffer used to hold the JSON request body for
+	  the status PUT. 512 bytes is sufficient for one status object.
+
+config APP_CLOUD_REST_POSITIONS_BUFFER_SIZE
+	int "Positions batch JSON buffer size in bytes"
+	default 2048
+	help
+	  Size of the static buffer used to accumulate multiple position
+	  records into a single POST /tracks/positions request body.
+	  Allows ~10 records at the default 60 s sample / 600 s transmit
+	  interval. Increase if more records can accumulate between sends.
 
 # --------------------------------------------------------------------------
 # Thread / watchdog

@@ -368,7 +368,7 @@ static void fetch_and_apply_config(void)
 }
 
 /* PUT /trackers/{id} — status update.
- * tracker_status: NULL for active, "noMotionSleep" for sleep notification.
+ * tracker_status: NULL = auto (active/activeWithoutFix), or explicit string.
  * Includes lastPosition (if a GNSS fix has been cached) and battery.
  * Returns 0: success, 1: fetchConfig:true, -1: error.
  */
@@ -394,14 +394,19 @@ static int send_status(const char *tracker_status)
 
 	snprintk(url_buf, sizeof(url_buf), "%s/%s", CONFIG_APP_CLOUD_REST_API_PATH, tracker_id);
 
-	/* Build JSON body: all fields optional, comma-separated */
+	/* Determine tracker status: explicit > auto from fix availability */
+	const char *status = tracker_status;
+
+	if (status == NULL) {
+		status = last_known_position_valid ? "active" : "activeWithoutFix";
+	}
+
+	/* Build JSON body */
 	json_len = snprintk(json_buf, sizeof(json_buf), "{");
 
-	if (tracker_status != NULL) {
-		json_len += snprintk(json_buf + json_len, sizeof(json_buf) - json_len,
-				     "\"trackerStatus\":\"%s\"", tracker_status);
-		comma = true;
-	}
+	json_len += snprintk(json_buf + json_len, sizeof(json_buf) - json_len,
+			     "\"trackerStatus\":\"%s\"", status);
+	comma = true;
 
 	if (last_known_position_valid) {
 		format_timestamp(timestamp, sizeof(timestamp), &last_known_position);
@@ -444,7 +449,7 @@ static int send_status(const char *tracker_status)
 		return -1;
 	}
 
-	LOG_DBG("PUT %s (%s)", url_buf, tracker_status ? tracker_status : "active");
+	LOG_DBG("PUT %s (%s)", url_buf, status);
 	LOG_DBG("  body=%s", json_buf);
 
 	sock = cloud_connect();
@@ -489,18 +494,16 @@ static int send_status(const char *tracker_status)
 	return -1;
 }
 
-/* POST /tracks/positions — send one stored position record.
+/* POST /tracks/positions — send accumulated positions JSON body.
+ * json_body must be a complete, null-terminated JSON string.
  * Returns 0: success, -1: error.
  */
-static int send_position_post(const struct tracker_record *rec)
+static int send_positions_batch_post(const char *json_body)
 {
-	static char json_buf[CONFIG_APP_CLOUD_REST_JSON_BUFFER_SIZE];
 	static uint8_t recv_buf[128];
 	char api_key_hdr[sizeof("X-Api-Key: \r\n") + sizeof(CONFIG_APP_CLOUD_REST_API_KEY)];
 	const char *api_key_hdrs[2] = { NULL, NULL };
-	char timestamp[32];
 	int http_status = 0;
-	int json_len;
 	int sock;
 	int err;
 
@@ -510,36 +513,8 @@ static int send_position_post(const struct tracker_record *rec)
 		api_key_hdrs[0] = api_key_hdr;
 	}
 
-	format_timestamp(timestamp, sizeof(timestamp), rec);
-
-	json_len = snprintk(json_buf, sizeof(json_buf),
-		"{"
-		"\"trackerId\":\"%s\","
-		"\"positions\":[{"
-		"\"sampleTimestamp\":\"%s\","
-		"\"latitude\":%.7f,"
-		"\"longitude\":%.7f,"
-		"\"gnssAcc\":%d,"
-		"\"pressure\":%d,"
-		"\"speed\":0,"
-		"\"temperature\":%d"
-		"}]}",
-		tracker_id,
-		timestamp,
-		rec->latitude,
-		rec->longitude,
-		(int)rec->accuracy_m,
-		rec->pressure_pa,
-		rec->temperature_c);
-
-	if (json_len < 0 || json_len >= (int)sizeof(json_buf)) {
-		LOG_ERR("send_position_post: JSON buffer overflow (%d bytes)", json_len);
-		return -1;
-	}
-
-	LOG_DBG("POST %s — lat=%.5f lon=%.5f acc=%dm ts=%s",
-		CONFIG_APP_CLOUD_REST_POSITIONS_API_PATH,
-		rec->latitude, rec->longitude, (int)rec->accuracy_m, timestamp);
+	LOG_DBG("POST %s — %d bytes", CONFIG_APP_CLOUD_REST_POSITIONS_API_PATH,
+		(int)strlen(json_body));
 
 	sock = cloud_connect();
 	if (sock < 0) {
@@ -554,8 +529,8 @@ static int send_position_post(const struct tracker_record *rec)
 		.protocol           = "HTTP/1.1",
 		.host               = CONFIG_APP_CLOUD_REST_SERVER_HOST,
 		.content_type_value = "application/json",
-		.payload            = json_buf,
-		.payload_len        = json_len,
+		.payload            = json_body,
+		.payload_len        = strlen(json_body),
 		.response           = http_response_cb,
 		.recv_buf           = recv_buf,
 		.recv_buf_len       = sizeof(recv_buf),
@@ -569,15 +544,87 @@ static int send_position_post(const struct tracker_record *rec)
 	zsock_close(sock);
 
 	if (err < 0) {
-		LOG_ERR("send_position_post: http_client_req failed: %d", err);
+		LOG_ERR("send_positions_batch_post: http_client_req failed: %d", err);
 		return -1;
 	}
 
-	if (http_status >= 200 && http_status < 300) {
-		return 0;
+	return (http_status >= 200 && http_status < 300) ? 0 : -1;
+}
+
+/* Positions JSON accumulation buffer — filled record by record, POSTed when batch ends */
+static char positions_batch_buf[CONFIG_APP_CLOUD_REST_POSITIONS_BUFFER_SIZE];
+static int  positions_batch_len;
+static int  positions_batch_count;
+
+/* Maximum bytes one position record can occupy (including leading comma) */
+#define POSITIONS_RECORD_MAX_BYTES 220
+
+/* Append one position record to the ongoing batch buffer.
+ * Starts a new batch automatically; handles overflow by flushing a partial batch first.
+ */
+static void positions_batch_append(const struct tracker_record *rec)
+{
+	char timestamp[32];
+
+	format_timestamp(timestamp, sizeof(timestamp), rec);
+
+	/* Flush partial batch if insufficient space for the next record + closing "]}" */
+	if (positions_batch_count > 0 &&
+	    (positions_batch_len + POSITIONS_RECORD_MAX_BYTES + 2) >=
+		    (int)sizeof(positions_batch_buf)) {
+		LOG_WRN("Positions buffer full at %d records — flushing early",
+			positions_batch_count);
+		snprintk(positions_batch_buf + positions_batch_len,
+			 sizeof(positions_batch_buf) - positions_batch_len, "]}");
+		send_positions_batch_post(positions_batch_buf);
+		positions_batch_len = 0;
+		positions_batch_count = 0;
 	}
 
-	return -1;
+	if (positions_batch_count == 0) {
+		positions_batch_len = snprintk(positions_batch_buf,
+					       sizeof(positions_batch_buf),
+					       "{\"trackerId\":\"%s\",\"positions\":[",
+					       tracker_id);
+	} else {
+		positions_batch_buf[positions_batch_len++] = ',';
+	}
+
+	positions_batch_len += snprintk(
+		positions_batch_buf + positions_batch_len,
+		sizeof(positions_batch_buf) - positions_batch_len,
+		"{\"sampleTimestamp\":\"%s\","
+		"\"latitude\":%.7f,"
+		"\"longitude\":%.7f,"
+		"\"gnssAcc\":%d,"
+		"\"pressure\":%d,"
+		"\"speed\":0,"
+		"\"temperature\":%d}",
+		timestamp,
+		rec->latitude,
+		rec->longitude,
+		(int)rec->accuracy_m,
+		rec->pressure_pa,
+		rec->temperature_c);
+
+	positions_batch_count++;
+}
+
+/* Close and POST the accumulated positions batch, then reset the buffer. */
+static void positions_batch_flush(void)
+{
+	if (positions_batch_count == 0) {
+		return;
+	}
+
+	snprintk(positions_batch_buf + positions_batch_len,
+		 sizeof(positions_batch_buf) - positions_batch_len, "]}");
+
+	LOG_INF("Posting %d position(s)", positions_batch_count);
+	send_positions_batch_post(positions_batch_buf);
+
+	positions_batch_len = 0;
+	positions_batch_count = 0;
 }
 
 /* Fetch config from server on first connect — cloud config is the primary source.
@@ -831,11 +878,13 @@ static enum smf_state_result state_connected_run(void *o)
 				s->batch_status_sent = false;
 				s->batch_fetch_config = false;
 				s->batch_session_id = smsg->session_id;
+				positions_batch_len = 0;
+				positions_batch_count = 0;
 			}
 
 			/* Send status PUT once per batch session */
 			if (!s->batch_status_sent) {
-				int fc = send_status("active");
+				int fc = send_status(NULL);
 
 				s->batch_status_sent = true;
 				if (fc < 0) {
@@ -861,15 +910,18 @@ static enum smf_state_result state_connected_run(void *o)
 				return SMF_EVENT_HANDLED;
 			}
 
-			int post_result = send_position_post(&item.data.TRACKER);
+			/* Accumulate record into positions batch */
+			positions_batch_append(&item.data.TRACKER);
 
-			if (post_result < 0) {
-				LOG_WRN("Position POST failed — keeping record for retry");
-				reply.type = STORAGE_BATCH_CLOSE;
-				zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
-				s->batch_session_id = 0;
+			/* Last record in batch: POST all accumulated positions, then ACK */
+			if (!smsg->more_data) {
+				positions_batch_flush();
+				if (s->batch_fetch_config) {
+					fetch_and_apply_config();
+				}
 				s->batch_status_sent = false;
-				return SMF_EVENT_HANDLED;
+				s->batch_fetch_config = false;
+				s->batch_session_id = 0;
 			}
 
 			reply.type = STORAGE_BATCH_ACK;
@@ -883,9 +935,9 @@ static enum smf_state_result state_connected_run(void *o)
 				.session_id = smsg->session_id,
 			};
 
-			/* No records — still send status if not sent yet for this interval */
+			/* No records — still send status for this interval */
 			if (!s->batch_status_sent) {
-				int fc = send_status("active");
+				int fc = send_status(NULL);
 
 				if (fc == 1) {
 					fetch_and_apply_config();
@@ -896,6 +948,8 @@ static enum smf_state_result state_connected_run(void *o)
 
 			s->batch_status_sent = false;
 			s->batch_fetch_config = false;
+			positions_batch_len = 0;
+			positions_batch_count = 0;
 			zbus_chan_pub(&storage_chan, &close, K_SECONDS(1));
 			s->batch_session_id = 0;
 			return SMF_EVENT_HANDLED;
