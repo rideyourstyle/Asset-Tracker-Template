@@ -896,11 +896,24 @@ static enum smf_state_result state_connected_run(void *o)
 
 			/* Send status PUT once per batch session */
 			if (!s->batch_status_sent) {
+				bool sleep_send = going_to_sleep; /* capture before consumed */
 				int fc = send_status(NULL);
 
 				s->batch_status_sent = true;
 				if (fc < 0) {
 					LOG_WRN("Status PUT failed — closing batch for retry");
+					reply.type = STORAGE_BATCH_CLOSE;
+					zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
+					s->batch_session_id = 0;
+					s->batch_status_sent = false;
+					s->batch_first_record = false;
+					return SMF_EVENT_HANDLED;
+				}
+				if (sleep_send) {
+					/* noMotionSleep: close batch immediately.
+					 * Stored positions are sent on the next wake-up
+					 * when the device is connected anyway. */
+					LOG_DBG("noMotionSleep — skipping positions, closing batch");
 					reply.type = STORAGE_BATCH_CLOSE;
 					zbus_chan_pub(&storage_chan, &reply, K_SECONDS(1));
 					s->batch_session_id = 0;

@@ -359,9 +359,19 @@ static enum smf_state_result state_location_search_inactive_run(void *obj)
 		if (location_msg->type == LOCATION_SEARCH_CANCEL) {
 			LOG_DBG("Location search cancel received in inactive state, ignoring");
 		} else if (location_msg->type == LOCATION_SEARCH_TRIGGER) {
-			LOG_DBG("Location search trigger received");
+			LOG_DBG("Location search trigger received (gnss_timeout_sec=%u)",
+				location_msg->gnss_timeout_sec);
 
-			err = location_request(NULL);
+			if (location_msg->gnss_timeout_sec > 0) {
+				struct location_config config;
+
+				location_config_defaults_set(&config, 0, NULL);
+				config.timeout = (int32_t)(location_msg->gnss_timeout_sec * 1000);
+				err = location_request(&config);
+			} else {
+				err = location_request(NULL);
+			}
+
 			if (err) {
 				LOG_WRN("location_request, error: %d", err);
 				SEND_FATAL_ERROR();

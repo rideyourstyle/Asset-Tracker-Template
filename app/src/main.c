@@ -289,12 +289,6 @@ struct main_state {
 	 */
 	bool cloud_synced_on_connect;
 
-	/* Set to true after the first complete send cycle (STORAGE_BATCH_CLOSE received in
-	 * STATE_CONNECTED_SENDING). Sleep via MOTION_INACTIVITY is only allowed once this
-	 * has happened — prevents the tracker from going to sleep before the server knows
-	 * its position.
-	 */
-	bool has_sent_status_once;
 
 	/* Set to true when MOTION_INACTIVITY arrives while the device is in a sampling
 	 * state (GNSS search in progress). The ADXL367 LINKED-mode cycles back to
@@ -308,6 +302,23 @@ struct main_state {
 	 * STATE_SLEEPING instead of STATE_CONNECTED_WAITING after the batch completes.
 	 */
 	bool sleep_after_send;
+
+	/* True until the first GNSS search completes (with or without fix).
+	 * Controls whether the long startup timeout (10 min) or the normal
+	 * sample_interval timeout is used for GNSS requests. */
+	bool first_gnss_attempt;
+
+	/* Set when a GNSS search timed out without a fix. waiting_entry_common
+	 * delays the next sample trigger by this many seconds instead of the
+	 * normal aligned interval. */
+	uint32_t gnss_skip_sec;
+
+	/* True if LOCATION_GNSS_DATA was received during the current search. */
+	bool gnss_fix_received;
+
+	/* Set permanently on the first successful GNSS fix. Used as sleep guard:
+	 * noMotionSleep is only allowed once the device has a known position. */
+	bool gnss_ever_fixed;
 
 	/* Flags to track if each module is ready */
 	struct {
@@ -551,6 +562,9 @@ static void trigger_sampling(struct main_state *state_object)
 	int err;
 	struct location_msg location_msg = {
 		.type = LOCATION_SEARCH_TRIGGER,
+		.gnss_timeout_sec = state_object->first_gnss_attempt
+				    ? 600u
+				    : (uint32_t)state_object->sample_interval_sec,
 	};
 
 #if defined(CONFIG_APP_LED)
@@ -576,6 +590,7 @@ static void trigger_sampling(struct main_state *state_object)
 
 	state_object->sample_start_time = k_uptime_seconds();
 	state_object->first_sample_pending = false;
+	state_object->gnss_fix_received = false;
 
 #if defined(CONFIG_APP_POWER)
 	struct power_msg power_msg = {
@@ -650,14 +665,21 @@ static uint32_t aligned_sample_delay(uint32_t interval_sec)
 			     : (uint32_t)((int64_t)interval_sec - offset);
 }
 
-static void waiting_entry_common(const struct main_state *state_object)
+static void waiting_entry_common(struct main_state *state_object)
 {
 	uint32_t time_remaining;
 
-	/* Reschedule the next sample trigger, aligned to clock boundaries */
-	time_remaining = aligned_sample_delay(state_object->sample_interval_sec);
-
-	LOG_DBG("Next sample trigger in %d seconds (aligned)", time_remaining);
+	if (state_object->gnss_skip_sec > 0) {
+		/* After a GNSS timeout: delay next search instead of using the
+		 * aligned boundary so we don't hammer the GNSS right away. */
+		time_remaining = state_object->gnss_skip_sec;
+		state_object->gnss_skip_sec = 0;
+		LOG_INF("Next sample trigger in %u seconds (GNSS skip)", time_remaining);
+	} else {
+		/* Reschedule the next sample trigger, aligned to clock boundaries */
+		time_remaining = aligned_sample_delay(state_object->sample_interval_sec);
+		LOG_DBG("Next sample trigger in %d seconds (aligned)", time_remaining);
+	}
 
 	timer_sample_start(time_remaining);
 }
@@ -1385,7 +1407,8 @@ static void disconnected_waiting_entry(void *o)
 	LOG_DBG("%s", __func__);
 
 #if defined(CONFIG_APP_MOTION)
-	if (state_object->motion_inactivity_pending && state_object->has_sent_status_once) {
+	if (state_object->motion_inactivity_pending &&
+	    state_object->gnss_ever_fixed) {
 		LOG_INF("Deferred MOTION_INACTIVITY — entering sleep mode");
 		state_object->motion_inactivity_pending = false;
 		smf_set_state(SMF_CTX(state_object), &states[STATE_SLEEPING]);
@@ -1458,8 +1481,8 @@ static enum smf_state_result disconnected_waiting_run(void *o)
 		const struct motion_msg *msg = (const struct motion_msg *)state_object->msg_buf;
 
 		if (msg->type == MOTION_INACTIVITY) {
-			if (!state_object->has_sent_status_once) {
-				LOG_DBG("MOTION_INACTIVITY ignored — no status sent yet");
+			if (!state_object->gnss_ever_fixed) {
+				LOG_DBG("MOTION_INACTIVITY ignored — no GNSS fix yet");
 				return SMF_EVENT_HANDLED;
 			}
 			LOG_INF("Device stationary — entering sleep mode");
@@ -1498,11 +1521,26 @@ static enum smf_state_result connected_sampling_run(void *o)
 	if (state_object->chan == &location_chan) {
 		const struct location_msg *msg = (const struct location_msg *)state_object->msg_buf;
 
+		if (msg->type == LOCATION_GNSS_DATA) {
+			state_object->gnss_fix_received = true;
+			state_object->gnss_ever_fixed = true;
+			return SMF_EVENT_PROPAGATE; /* let cloud.c also process it */
+		}
+
 		if (msg->type == LOCATION_SEARCH_DONE) {
-			/* Sampling is independent from sending — always return to WAITING.
-			 * If the status timer fired while we were sampling (send_pending),
-			 * connected_waiting_entry will immediately redirect to SENDING.
-			 */
+			if (!state_object->gnss_fix_received) {
+				/* Timeout without fix — schedule a skip before the next search */
+				if (state_object->first_gnss_attempt) {
+					LOG_INF("First GNSS attempt timed out — retry in 10 min");
+					state_object->gnss_skip_sec = 600u;
+				} else {
+					LOG_INF("GNSS timed out — skipping next sample interval");
+					state_object->gnss_skip_sec =
+						(uint32_t)state_object->sample_interval_sec;
+				}
+			}
+			state_object->first_gnss_attempt = false;
+
 			LOG_DBG("GNSS search done — returning to waiting");
 			smf_set_state(SMF_CTX(state_object),
 				      &states[STATE_CONNECTED_WAITING]);
@@ -1568,7 +1606,8 @@ static void connected_waiting_entry(void *o)
 	LOG_DBG("%s", __func__);
 
 #if defined(CONFIG_APP_MOTION)
-	if (state_object->motion_inactivity_pending && state_object->has_sent_status_once) {
+	if (state_object->motion_inactivity_pending &&
+	    state_object->gnss_ever_fixed) {
 		if (state_object->send_pending) {
 			/* Status timer also deferred — send the regular active update first.
 			 * motion_inactivity_pending stays true so the NEXT waiting entry
@@ -1665,8 +1704,8 @@ static enum smf_state_result connected_waiting_run(void *o)
 		const struct motion_msg *msg = (const struct motion_msg *)state_object->msg_buf;
 
 		if (msg->type == MOTION_INACTIVITY) {
-			if (!state_object->has_sent_status_once) {
-				LOG_DBG("MOTION_INACTIVITY ignored — no status sent yet");
+			if (!state_object->gnss_ever_fixed) {
+				LOG_DBG("MOTION_INACTIVITY ignored — no GNSS fix yet");
 				return SMF_EVENT_HANDLED;
 			}
 			LOG_INF("Device stationary — sending noMotionSleep then sleeping");
@@ -1734,7 +1773,7 @@ static enum smf_state_result connected_sending_run(void *o)
 
 		/* Storage batch closed indicates sending is done */
 		if (msg->type == STORAGE_BATCH_CLOSE) {
-			state_object->has_sent_status_once = true;
+
 			if (state_object->sleep_after_send) {
 				state_object->sleep_after_send = false;
 				smf_set_state(SMF_CTX(state_object),
@@ -1747,23 +1786,18 @@ static enum smf_state_result connected_sending_run(void *o)
 			return SMF_EVENT_HANDLED;
 		}
 
-		/* Empty/busy/error: status was still sent by cloud.c, count it */
-		if (msg->type == STORAGE_BATCH_EMPTY ||
-		    msg->type == STORAGE_BATCH_BUSY  ||
-		    msg->type == STORAGE_BATCH_ERROR) {
-			if (msg->type != STORAGE_BATCH_EMPTY) {
-				LOG_WRN("Batch not started (%d)", msg->type);
-			}
-			state_object->has_sent_status_once = true;
-			if (state_object->sleep_after_send) {
-				state_object->sleep_after_send = false;
-				smf_set_state(SMF_CTX(state_object),
-					      &states[STATE_SLEEPING]);
-			} else {
-				smf_set_state(SMF_CTX(state_object),
-					      &states[STATE_CONNECTED_WAITING]);
-			}
+		/* BATCH_EMPTY and BATCH_ERROR are handled by cloud.c, which sends
+		 * the status PUT and then publishes STORAGE_BATCH_CLOSE. We wait
+		 * for that CLOSE (above) so the HTTP request finishes before we
+		 * disconnect. Handling these here would race with cloud.c's PUT. */
 
+		/* BATCH_BUSY: storage is already active — cloud.c has no handler
+		 * for this, so we must recover here to avoid getting stuck. */
+		if (msg->type == STORAGE_BATCH_BUSY) {
+			LOG_WRN("Storage batch busy — returning to waiting");
+			state_object->sleep_after_send = false;
+			smf_set_state(SMF_CTX(state_object),
+				      &states[STATE_CONNECTED_WAITING]);
 			return SMF_EVENT_HANDLED;
 		}
 	}
@@ -2151,6 +2185,7 @@ int main(void)
 	main_state.update_interval_sec = CONFIG_APP_CLOUD_UPDATE_INTERVAL_SECONDS;
 	main_state.storage_threshold = CONFIG_APP_STORAGE_INITIAL_THRESHOLD;
 	main_state.first_sample_pending = true;
+	main_state.first_gnss_attempt = true;
 
 	/* Reschedule sample timer to aligned boundary when clock is first synced */
 	date_time_register_handler(date_time_evt_handler);

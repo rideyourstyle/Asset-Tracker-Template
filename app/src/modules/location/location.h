@@ -176,6 +176,12 @@ struct location_cloud_request_data {
 /* Structure to pass location data through zbus */
 struct location_msg {
 	enum location_msg_type type;
+
+	/** GNSS timeout in seconds for LOCATION_SEARCH_TRIGGER.
+	 *  0 means use the compiled default (no timeout).
+	 */
+	uint32_t gnss_timeout_sec;
+
 	union {
 		/** Contains cloud location request data with cellular and/or Wi-Fi information.
 		 *  cloud_request is valid for LOCATION_CLOUD_REQUEST events.
