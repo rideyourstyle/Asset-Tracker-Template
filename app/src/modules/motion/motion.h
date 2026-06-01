@@ -7,33 +7,26 @@
 #ifndef _MOTION_H_
 #define _MOTION_H_
 
-#include <zephyr/kernel.h>
-#include <zephyr/zbus/zbus.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Channels provided by this module */
-ZBUS_CHAN_DECLARE(
-	motion_chan
-);
-
-enum motion_msg_type {
-	/* The device has started moving.
-	 * Published when the ADXL367 activity threshold is exceeded.
-	 */
-	MOTION_ACTIVITY = 0x1,
-
-	/* The device has been stationary.
-	 * Published when all axes stay below the inactivity threshold for the configured time.
-	 */
-	MOTION_INACTIVITY,
-};
-
-struct motion_msg {
-	enum motion_msg_type type;
-};
+/**
+ * Take one ACC snapshot and compare it to the previous sample.
+ *
+ * Returns true  if the device appears to be moving (delta > threshold).
+ * Returns false if the device appears to be stationary.
+ *
+ * Call once at the end of each sampling cycle (LOCATION_SEARCH_DONE).
+ * The internal reference is always advanced after each call, so consecutive
+ * calls compare adjacent sampling windows.
+ *
+ * A parked-but-tilted device is correctly detected as stationary because
+ * two consecutive snapshots at the same orientation are identical.
+ */
+bool motion_snapshot_check(void);
 
 #ifdef __cplusplus
 }

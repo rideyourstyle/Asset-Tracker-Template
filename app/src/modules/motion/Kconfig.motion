@@ -10,28 +10,11 @@ config APP_MOTION
 	bool "Motion detection module (ADXL367)"
 	depends on ADXL367
 	help
-	  Enable the motion detection module. Uses the on-board ADXL367
-	  low-power accelerometer to publish MOTION_ACTIVITY and
-	  MOTION_INACTIVITY events on the motion_chan zbus channel.
-	  Uses software polling — the ADXL367 hardware interrupt is not
-	  used (known issue on Thingy:91 X, devzone.nordicsemi.com/f/nordic-q-a/126611).
-
-config APP_MOTION_POLL_INTERVAL_MS
-	int "Accelerometer poll interval (ms)"
-	depends on APP_MOTION
-	default 1000
-	help
-	  How often the ADXL367 is sampled for the software-based
-	  activity/inactivity detection.
-
-config APP_MOTION_INACTIVITY_SECONDS
-	int "Inactivity duration before sleep (seconds)"
-	depends on APP_MOTION
-	default 180
-	help
-	  Number of consecutive seconds below the inactivity threshold
-	  before MOTION_INACTIVITY is published. At the default 1 s poll
-	  interval this equals the number of poll samples.
+	  Enable snapshot-based motion detection using the on-board ADXL367
+	  low-power accelerometer. Called once per sampling cycle at the end
+	  of each GNSS search (LOCATION_SEARCH_DONE). Compares consecutive
+	  ACC snapshots — a stationary device reads near-zero delta regardless
+	  of mounting angle.
 
 module = APP_MOTION
 module-str = Motion
