@@ -135,11 +135,15 @@ enum cloud_msg_type {
 	 */
 	CLOUD_CONFIG_UPDATE,
 
-	/* Device is about to enter low-power sleep. main.c publishes this on cloud_chan before
-	 * sleeping so that cloud.c can send a PUT with trackerStatus:"noMotionSleep" while still
-	 * connected, then cloud.c publishes NETWORK_DISCONNECT to take the modem offline.
+	/* Device is stationary — no GNSS was attempted this cycle.
+	 * main.c publishes this before the batch so cloud.c uses trackerStatus:"noMotionSleep".
 	 */
 	CLOUD_GOING_TO_SLEEP,
+
+	/* Device was moving but GNSS search timed out without a fix.
+	 * main.c publishes this before the batch so cloud.c uses trackerStatus:"noFix".
+	 */
+	CLOUD_NO_FIX,
 };
 
 /** New config values received from the server via GET /trackers/{id}/config?ack=true. */

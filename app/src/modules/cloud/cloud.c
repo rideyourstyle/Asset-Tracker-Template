@@ -117,9 +117,10 @@ static char tracker_id[TRACKER_ID_LEN];
 /* Watchdog channel ID — made file-scope so state handlers can feed it during batch loops */
 static int cloud_task_wdt_id = -1;
 
-/* Set to true by the CLOUD_GOING_TO_SLEEP handler before a sleep-induced batch send.
- * Consumed by send_status(NULL) to select "noMotionSleep" instead of "active". */
-static bool going_to_sleep;
+/* Status hint flags — set by cloud_chan message handlers before send_status(NULL) is called.
+ * Exactly one should be set per batch send; the flags are consumed on read. */
+static bool going_to_sleep; /* → "noMotionFix": stationary, GNSS not attempted */
+static bool no_fix;         /* → "noFix": moving, GNSS timed out */
 
 /* -------------------------------------------------------------------------- */
 /* State machine declarations                                                  */
@@ -407,8 +408,11 @@ static int send_status(const char *tracker_status)
 		if (going_to_sleep) {
 			status = "noMotionSleep";
 			going_to_sleep = false;
+		} else if (no_fix) {
+			status = "activeWithoutFix";
+			no_fix = false;
 		} else {
-			status = last_known_position_valid ? "active" : "activeWithoutFix";
+			status = "active";
 		}
 	}
 
@@ -1023,6 +1027,10 @@ static enum smf_state_result state_connected_run(void *o)
 		 * and the network disconnect is issued by sleeping_entry in main.c. */
 		if (msg->type == CLOUD_GOING_TO_SLEEP) {
 			going_to_sleep = true;
+			return SMF_EVENT_HANDLED;
+		}
+		if (msg->type == CLOUD_NO_FIX) {
+			no_fix = true;
 			return SMF_EVENT_HANDLED;
 		}
 

@@ -51,11 +51,8 @@ LOG_MODULE_REGISTER(main, 4);
 ZBUS_MSG_SUBSCRIBER_DEFINE(main_subscriber);
 
 enum timer_msg_type {
-	/* Timer for sampling data has expired — triggers a GNSS search + sensor read. */
+	/* Timer for sampling data has expired — triggers ACC check + optional GNSS search. */
 	TIMER_EXPIRED_SAMPLE_DATA,
-
-	/* Timer for status update has expired — triggers PUT trackerStatus + POST positions. */
-	TIMER_EXPIRED_STATUS_UPDATE,
 
 	/* Configuration has changed; timers restart with new intervals. */
 	TIMER_CONFIG_CHANGED,
@@ -145,15 +142,10 @@ CHANNEL_LIST(ADD_OBSERVERS)
 
 /* Forward declarations */
 static void timer_sample_data_work_fn(struct k_work *work);
-static void timer_status_update_work_fn(struct k_work *work);
 static void timer_sample_start(uint32_t delay_sec);
 static void timer_sample_stop(void);
-static void timer_status_start(uint32_t delay_sec);
-static void timer_status_stop(void);
 
-/* Delayable work items for the two independent timers */
 static K_WORK_DELAYABLE_DEFINE(timer_sample_data_work, timer_sample_data_work_fn);
-static K_WORK_DELAYABLE_DEFINE(timer_status_update_work, timer_status_update_work_fn);
 
 /* Forward declarations of state handlers */
 static enum smf_state_result waiting_for_modules_init_run(void *o);
@@ -260,8 +252,18 @@ struct main_state {
 	/* Trigger interval */
 	uint32_t sample_interval_sec;
 
-	/* Update interval, how often the device synchronizes with the cloud */
+	/* Update interval in seconds — kept for cloud config reporting.
+	 * Internally the device uses update_factor (= update_interval / sample_interval). */
 	uint32_t update_interval_sec;
+
+	/* How many samples between cloud updates (update_interval / sample_interval). */
+	uint32_t update_factor;
+
+	/* Incremented at the start of every sample cycle; wraps naturally at UINT32_MAX. */
+	uint32_t sample_count;
+
+	/* True when this sample cycle should trigger a cloud update (status PUT + positions). */
+	bool update_due;
 
 	uint32_t storage_threshold;
 
@@ -270,11 +272,6 @@ struct main_state {
 
 	/* Fire the very first sample immediately on boot. */
 	bool first_sample_pending;
-
-	/* Status update is due: send trackerStatus PUT + flush positions on next WAITING entry.
-	 * Set when TIMER_EXPIRED_STATUS_UPDATE fires during sampling, so it is not lost.
-	 */
-	bool send_pending;
 
 	/* Storage batch session ID for batch operations */
 	uint32_t storage_session_id;
@@ -306,11 +303,6 @@ struct main_state {
 	 * Controls whether the long startup timeout (10 min) or the normal
 	 * sample_interval timeout is used for GNSS requests. */
 	bool first_gnss_attempt;
-
-	/* Set when a GNSS search timed out without a fix. waiting_entry_common
-	 * delays the next sample trigger by this many seconds instead of the
-	 * normal aligned interval. */
-	uint32_t gnss_skip_sec;
 
 	/* True if LOCATION_GNSS_DATA was received during the current search. */
 	bool gnss_fix_received;
@@ -666,21 +658,9 @@ static uint32_t aligned_sample_delay(uint32_t interval_sec)
 
 static void waiting_entry_common(struct main_state *state_object)
 {
-	uint32_t time_remaining;
+	uint32_t delay = aligned_sample_delay(state_object->sample_interval_sec);
 
-	if (state_object->gnss_skip_sec > 0) {
-		/* After a GNSS timeout: delay next search instead of using the
-		 * aligned boundary so we don't hammer the GNSS right away. */
-		time_remaining = state_object->gnss_skip_sec;
-		state_object->gnss_skip_sec = 0;
-		LOG_INF("Next sample trigger in %u seconds (GNSS skip)", time_remaining);
-	} else {
-		/* Reschedule the next sample trigger, aligned to clock boundaries */
-		time_remaining = aligned_sample_delay(state_object->sample_interval_sec);
-		LOG_DBG("Next sample trigger in %d seconds (aligned)", time_remaining);
-	}
-
-	timer_sample_start(time_remaining);
+	timer_sample_start(delay);
 }
 
 static void waiting_exit_common(void)
@@ -753,22 +733,6 @@ static void timer_sample_data_work_fn(struct k_work *work)
 	}
 }
 
-static void timer_status_update_work_fn(struct k_work *work)
-{
-	int err;
-	const struct timer_msg msg = { .type = TIMER_EXPIRED_STATUS_UPDATE };
-
-	ARG_UNUSED(work);
-
-	err = zbus_chan_pub(&timer_chan, &msg, PUB_TIMEOUT);
-	if (err) {
-		LOG_ERR("Failed to publish status update timer expired message, error: %d", err);
-		SEND_FATAL_ERROR();
-
-		return;
-	}
-}
-
 static void timer_sample_start(uint32_t delay_sec)
 {
 	int err;
@@ -790,24 +754,6 @@ static void timer_sample_stop(void)
 	if (err < 0) {
 		LOG_ERR("k_work_cancel_delayable timer_sample_data_work, error: %d", err);
 	}
-}
-
-static void timer_status_start(uint32_t delay_sec)
-{
-	int err;
-
-	err = k_work_reschedule(&timer_status_update_work, K_SECONDS(delay_sec));
-	if (err < 0) {
-		LOG_ERR("k_work_reschedule timer_status_update_work, error: %d", err);
-		SEND_FATAL_ERROR();
-
-		return;
-	}
-}
-
-static void timer_status_stop(void)
-{
-	k_work_cancel_delayable(&timer_status_update_work);
 }
 
 static void update_shadow_reported_section(const struct config_params *config,
@@ -903,6 +849,10 @@ static void config_apply(struct main_state *state_object, const struct config_pa
 	/* Notify waiting states that configuration has changed and timers need restart */
 	if (interval_changed) {
 		const struct timer_msg timer_msg = { .type = TIMER_CONFIG_CHANGED };
+
+		state_object->update_factor = MAX(1u, state_object->update_interval_sec /
+						       state_object->sample_interval_sec);
+		LOG_INF("Update factor: every %u samples", state_object->update_factor);
 
 		/* Reset sample start time so re-entering waiting state uses full new interval */
 		state_object->sample_start_time = k_uptime_seconds();
@@ -1296,6 +1246,11 @@ static enum smf_state_result connected_run(void *o)
 			if (changed) {
 				const struct timer_msg tmsg = { .type = TIMER_CONFIG_CHANGED };
 
+				state_object->update_factor =
+					MAX(1u, state_object->update_interval_sec /
+						state_object->sample_interval_sec);
+				LOG_INF("Update factor: every %u samples",
+					state_object->update_factor);
 				zbus_chan_pub(&timer_chan, &tmsg, PUB_TIMEOUT);
 			}
 
@@ -1361,10 +1316,14 @@ static enum smf_state_result disconnected_sampling_run(void *o)
 	if (state_object->chan == &location_chan) {
 		const struct location_msg *msg = (const struct location_msg *)state_object->msg_buf;
 
+		if (msg->type == LOCATION_GNSS_DATA) {
+			state_object->gnss_fix_received = true;
+			state_object->gnss_ever_fixed = true;
+			return SMF_EVENT_PROPAGATE;
+		}
+
 		if (msg->type == LOCATION_SEARCH_DONE) {
-#if defined(CONFIG_APP_MOTION)
-			state_object->stationary = !motion_snapshot_check();
-#endif
+			state_object->first_gnss_attempt = false;
 			smf_set_state(SMF_CTX(state_object), &states[STATE_DISCONNECTED_WAITING]);
 
 			return SMF_EVENT_HANDLED;
@@ -1390,16 +1349,6 @@ static void disconnected_waiting_entry(void *o)
 	struct main_state *state_object = (struct main_state *)o;
 
 	LOG_DBG("%s", __func__);
-
-#if defined(CONFIG_APP_MOTION)
-	if (state_object->stationary && state_object->gnss_ever_fixed) {
-		LOG_INF("Stationary — entering sleep mode");
-		state_object->stationary = false;
-		smf_set_state(SMF_CTX(state_object), &states[STATE_SLEEPING]);
-		return;
-	}
-	state_object->stationary = false;
-#endif /* CONFIG_APP_MOTION */
 
 	waiting_entry_common(state_object);
 
@@ -1434,6 +1383,13 @@ static enum smf_state_result disconnected_waiting_run(void *o)
 		const struct timer_msg *msg = (const struct timer_msg *)state_object->msg_buf;
 
 		if (msg->type == TIMER_EXPIRED_SAMPLE_DATA) {
+#if defined(CONFIG_APP_MOTION)
+			if (!motion_snapshot_check()) {
+				/* Stationary — skip GNSS, wait for next interval */
+				waiting_entry_common(state_object);
+				return SMF_EVENT_HANDLED;
+			}
+#endif
 			smf_set_state(SMF_CTX(state_object),
 				      &states[STATE_DISCONNECTED_SAMPLING]);
 
@@ -1495,37 +1451,32 @@ static enum smf_state_result connected_sampling_run(void *o)
 		}
 
 		if (msg->type == LOCATION_SEARCH_DONE) {
-			if (!state_object->gnss_fix_received) {
-				/* Timeout without fix — schedule a skip before the next search */
-				if (state_object->first_gnss_attempt) {
-					LOG_INF("First GNSS attempt timed out — retry in 10 min");
-					state_object->gnss_skip_sec = 600u;
-				} else {
-					LOG_INF("GNSS timed out — skipping next sample interval");
-					state_object->gnss_skip_sec =
-						(uint32_t)state_object->sample_interval_sec;
-				}
-			}
 			state_object->first_gnss_attempt = false;
 
-#if defined(CONFIG_APP_MOTION)
-			state_object->stationary = !motion_snapshot_check();
-#endif
-			LOG_DBG("GNSS search done — returning to waiting");
-			smf_set_state(SMF_CTX(state_object),
-				      &states[STATE_CONNECTED_WAITING]);
+			if (state_object->update_due) {
+				if (!state_object->gnss_fix_received) {
+					int err;
+					struct cloud_msg no_fix_msg = { .type = CLOUD_NO_FIX };
+
+					err = zbus_chan_pub(&cloud_chan, &no_fix_msg, PUB_TIMEOUT);
+					if (err) {
+						LOG_WRN("CLOUD_NO_FIX pub failed: %d", err);
+					}
+				}
+				smf_set_state(SMF_CTX(state_object),
+					      &states[STATE_CONNECTED_SENDING]);
+			} else {
+				smf_set_state(SMF_CTX(state_object),
+					      &states[STATE_CONNECTED_WAITING]);
+			}
 			return SMF_EVENT_HANDLED;
 		}
 	}
 
-	/* Status timer fired while GNSS search is in progress — defer until WAITING */
+	/* Ignore sample timer re-fires while GNSS is still running */
 	if (state_object->chan == &timer_chan) {
 		const struct timer_msg *msg = (const struct timer_msg *)state_object->msg_buf;
 
-		if (msg->type == TIMER_EXPIRED_STATUS_UPDATE) {
-			state_object->send_pending = true;
-			return SMF_EVENT_HANDLED;
-		}
 		if (msg->type == TIMER_EXPIRED_SAMPLE_DATA) {
 			return SMF_EVENT_HANDLED;
 		}
@@ -1559,43 +1510,7 @@ static void connected_waiting_entry(void *o)
 
 	LOG_DBG("%s", __func__);
 
-#if defined(CONFIG_APP_MOTION)
-	if (state_object->stationary && state_object->gnss_ever_fixed) {
-		int err;
-		struct cloud_msg sleep_msg = { .type = CLOUD_GOING_TO_SLEEP };
-
-		LOG_INF("Stationary — sending noMotionSleep then sleeping");
-		state_object->stationary = false;
-		state_object->send_pending = false; /* noMotionSleep supersedes regular status */
-		state_object->sleep_after_send = true;
-
-		err = zbus_chan_pub(&cloud_chan, &sleep_msg, PUB_TIMEOUT);
-		if (err) {
-			LOG_ERR("Failed to publish CLOUD_GOING_TO_SLEEP, error: %d", err);
-			SEND_FATAL_ERROR();
-			return;
-		}
-		smf_set_state(SMF_CTX(state_object), &states[STATE_CONNECTED_SENDING]);
-		return;
-	}
-	state_object->stationary = false;
-#endif /* CONFIG_APP_MOTION */
-
-	/* Status update was deferred because it fired during sampling */
-	if (state_object->send_pending) {
-		state_object->send_pending = false;
-		smf_set_state(SMF_CTX(state_object), &states[STATE_CONNECTED_SENDING]);
-		return;
-	}
-
 	waiting_entry_common(state_object);
-
-	/* Only start the status timer if it is not already counting down.
-	 * With sample_interval < update_interval the timer must survive
-	 * WAITING→SAMPLING→WAITING cycles without being reset each time. */
-	if (!k_work_delayable_is_pending(&timer_status_update_work)) {
-		timer_status_start(state_object->update_interval_sec);
-	}
 }
 
 static enum smf_state_result connected_waiting_run(void *o)
@@ -1606,26 +1521,47 @@ static enum smf_state_result connected_waiting_run(void *o)
 		const struct timer_msg *msg = (const struct timer_msg *)state_object->msg_buf;
 
 		if (msg->type == TIMER_EXPIRED_SAMPLE_DATA) {
+			/* Determine update_due before incrementing so first sample always sends */
+			state_object->update_due =
+				(state_object->sample_count % state_object->update_factor) == 0;
+			state_object->sample_count++;
+			state_object->gnss_fix_received = false;
+
+#if defined(CONFIG_APP_MOTION)
+			if (!motion_snapshot_check()) {
+				/* Stationary — skip GNSS */
+				if (state_object->update_due) {
+					int err;
+					struct cloud_msg sleep_msg = {
+						.type = CLOUD_GOING_TO_SLEEP
+					};
+
+					LOG_INF("Stationary + update due → noMotionFix");
+					state_object->sleep_after_send = true;
+					err = zbus_chan_pub(&cloud_chan, &sleep_msg, PUB_TIMEOUT);
+					if (err) {
+						LOG_ERR("CLOUD_GOING_TO_SLEEP pub failed: %d",
+							err);
+						SEND_FATAL_ERROR();
+						return SMF_EVENT_HANDLED;
+					}
+					smf_set_state(SMF_CTX(state_object),
+						      &states[STATE_CONNECTED_SENDING]);
+				} else {
+					/* No update needed — restart timer */
+					waiting_entry_common(state_object);
+				}
+				return SMF_EVENT_HANDLED;
+			}
+#endif
 			smf_set_state(SMF_CTX(state_object),
 				      &states[STATE_CONNECTED_SAMPLING]);
-
-			return SMF_EVENT_HANDLED;
-		}
-
-		if (msg->type == TIMER_EXPIRED_STATUS_UPDATE) {
-			smf_set_state(SMF_CTX(state_object),
-				      &states[STATE_CONNECTED_SENDING]);
-
 			return SMF_EVENT_HANDLED;
 		}
 
 		if (msg->type == TIMER_CONFIG_CHANGED) {
-			/* Stop status timer so connected_waiting_entry restarts it
-			 * with the new interval (pending-check won't block the restart). */
-			timer_status_stop();
 			smf_set_state(SMF_CTX(state_object),
 				      &states[STATE_CONNECTED_WAITING]);
-
 			return SMF_EVENT_HANDLED;
 		}
 	}
@@ -1636,7 +1572,6 @@ static enum smf_state_result connected_waiting_run(void *o)
 		if (msg->type == BUTTON_PRESS_SHORT) {
 			smf_set_state(SMF_CTX(state_object),
 				      &states[STATE_CONNECTED_SAMPLING]);
-
 			return SMF_EVENT_HANDLED;
 		}
 	}
@@ -1665,16 +1600,6 @@ static void connected_sending_entry(void *o)
 static enum smf_state_result connected_sending_run(void *o)
 {
 	struct main_state *state_object = (struct main_state *)o;
-
-	if (state_object->chan == &timer_chan) {
-		const struct timer_msg *msg = (const struct timer_msg *)state_object->msg_buf;
-
-		/* Status timer fired while sending — defer to next WAITING entry */
-		if (msg->type == TIMER_EXPIRED_STATUS_UPDATE) {
-			state_object->send_pending = true;
-			return SMF_EVENT_HANDLED;
-		}
-	}
 
 	if (state_object->chan == &storage_chan) {
 		const struct storage_msg *msg = (const struct storage_msg *)state_object->msg_buf;
@@ -1725,8 +1650,6 @@ static void sleeping_entry(void *o)
 	struct main_state *state_object = (struct main_state *)o;
 	int err;
 	struct network_msg net_msg = { .type = NETWORK_DISCONNECT };
-
-	timer_status_stop();
 
 	/* Wake up at the next aligned sample boundary and retry */
 	waiting_entry_common(state_object);
@@ -2105,6 +2028,8 @@ int main(void)
 
 	main_state.sample_interval_sec = CONFIG_APP_SAMPLING_INTERVAL_SECONDS;
 	main_state.update_interval_sec = CONFIG_APP_CLOUD_UPDATE_INTERVAL_SECONDS;
+	main_state.update_factor      = MAX(1u, CONFIG_APP_CLOUD_UPDATE_INTERVAL_SECONDS /
+					         CONFIG_APP_SAMPLING_INTERVAL_SECONDS);
 	main_state.storage_threshold = CONFIG_APP_STORAGE_INITIAL_THRESHOLD;
 	main_state.first_sample_pending = true;
 	main_state.first_gnss_attempt = true;
